@@ -166,6 +166,7 @@ class MarketBasedSolver(GreedyMMCE):
     AUCTION_BUFFER_TIME = 15.0     # DELIVERING 无人机距终点 T_remain 小于此值时允许预调度
     PATH_STITCH_TOLERANCE_M = 1.0  # 路径拼接坐标容差（米）
     AUCTION_COMPUTE_DELTA_T = 0.5  # 拍卖计算预估耗时（用于起点预测）
+    MODE_C_DEPOT_TOLERANCE_M = 25.0  # Mode C 起飞时无人机与仓库位置容差
 
     # ── 路径方向性与多维优化参数 ────────────────────────────────────
     BACKTRACK_PENALTY_WEIGHT = 2.0       # 回头路惩罚权重（方向角越偏离前进方向，惩罚越高）
@@ -390,6 +391,46 @@ class MarketBasedSolver(GreedyMMCE):
                 if carry != order_id and pend != order_id and not route_refs_order:
                     continue
 
+                # 保守保护：只清理“静止残留状态”。
+                # 对于仍有活动航路/等待回收/服务停留中的无人机，
+                # 禁止在增量拍卖中强制清路由，避免前端轨迹断裂与实体卡死。
+                if getattr(drone, "delivery_service_end_time", 0.0) > current_time:
+                    logger.warning(
+                        "[MarketBasedSolver] 订单 %s 候选改派触发，但无人机 %s 仍在服务停留，"
+                        "拒绝撤销其航路",
+                        order_id,
+                        drone.drone_id,
+                    )
+                    for a in plan.allocations:
+                        if a.order_id == order_id and a.drone_id == winner_id:
+                            a.feasible = False
+                            a.reason = "原执行无人机仍在服务停留，拒绝改派"
+                    break
+                if getattr(drone, "waiting_recovery_station_id", ""):
+                    logger.warning(
+                        "[MarketBasedSolver] 订单 %s 候选改派触发，但无人机 %s 正在等待回收，"
+                        "拒绝撤销其航路",
+                        order_id,
+                        drone.drone_id,
+                    )
+                    for a in plan.allocations:
+                        if a.order_id == order_id and a.drone_id == winner_id:
+                            a.feasible = False
+                            a.reason = "原执行无人机等待回收中，拒绝改派"
+                    break
+                if bool(getattr(drone, "has_pending_route", False)) and carry == order_id:
+                    logger.warning(
+                        "[MarketBasedSolver] 订单 %s 候选改派触发，但无人机 %s 仍有待执行航路，"
+                        "拒绝撤销其航路",
+                        order_id,
+                        drone.drone_id,
+                    )
+                    for a in plan.allocations:
+                        if a.order_id == order_id and a.drone_id == winner_id:
+                            a.feasible = False
+                            a.reason = "原执行无人机仍有待执行航路，拒绝改派"
+                    break
+
                 # 再次检查：若该无人机正在物理执行该订单（飞行中），拒绝撤销
                 if carry == order_id and drone.status.is_flying:
                     logger.warning(
@@ -503,12 +544,26 @@ class MarketBasedSolver(GreedyMMCE):
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
 
+        # 兜底：避免调用侧漏传最后一批动态单，合并当前 pending 订单参与本轮拍卖。
+        candidate_orders = dict(new_orders)
+        adopted_pending = 0
+        if self._order_mgr:
+            for oid, order in self._order_mgr.pending_orders.items():
+                if oid not in candidate_orders:
+                    candidate_orders[oid] = order
+                    adopted_pending += 1
+        if adopted_pending > 0:
+            logger.info(
+                "[MarketBasedSolver] 增量调度补入 %d 个 pending 订单（防止动态单漏拍）",
+                adopted_pending,
+            )
+
         # 不可变更过滤：排除已进入履约状态的订单
         filtered_orders = {
-            oid: order for oid, order in new_orders.items()
+            oid: order for oid, order in candidate_orders.items()
             if not self._is_order_immutable(oid, current_time)
         }
-        skipped = len(new_orders) - len(filtered_orders)
+        skipped = len(candidate_orders) - len(filtered_orders)
         if skipped > 0:
             logger.info(
                 "[MarketBasedSolver] 增量调度过滤 %d 个不可变更订单（已处于 PICKED_UP/DELIVERING）",
@@ -1230,11 +1285,17 @@ class MarketBasedSolver(GreedyMMCE):
 
         # 3. 防防御性补丁 2：检查当前挂载在本车上尚未起飞的无人机目标站（补偿跨批次 B_DYNAMIC 任务）
         for drone in self.entity_mgr.drones.values():
-            if getattr(drone, "transport_truck_id", None) == truck.truck_id:
-                s_id = getattr(drone, "launch_station_id", "")
-                if s_id and s_id not in recovery_station_ids:
-                    recovery_station_ids.append(s_id)
-                    added_stations.append(s_id)
+            if getattr(drone, "transport_truck_id", None) != truck.truck_id:
+                continue
+            # 仅补偿“真实待起飞”的站点，避免历史脏状态把卡车拉回头路。
+            if drone.status != DroneStatus.IDLE:
+                continue
+            if not getattr(drone, "route_plan", None):
+                continue
+            s_id = getattr(drone, "launch_station_id", "")
+            if s_id and s_id not in recovery_station_ids:
+                recovery_station_ids.append(s_id)
+                added_stations.append(s_id)
 
         if added_stations:
             logger.debug(
@@ -1532,6 +1593,14 @@ class MarketBasedSolver(GreedyMMCE):
         if drone.status == DroneStatus.IDLE:
             if getattr(drone, "carrying_order_id", None):
                 return "REJECT", None
+            # 关键修复：IDLE 但已挂载待执行路径/待起飞时，必须视作锁定，
+            # 防止增量拍卖重复占用同一无人机造成轨迹覆盖。
+            if bool(getattr(drone, "has_pending_route", False)):
+                return "LOCKED", None
+            if float(getattr(drone, "scheduled_launch_time", 0.0)) > current_time + 1e-6:
+                return "LOCKED", None
+            if getattr(drone, "launch_station_id", "") and getattr(drone, "transport_truck_id", None):
+                return "LOCKED", None
             if getattr(drone, "waiting_recovery_station_id", ""):
                 return "LOCKED", None
             return "IDLE", drone.current_loc
@@ -1973,6 +2042,9 @@ class MarketBasedSolver(GreedyMMCE):
             return None
 
         depot = depots[0]
+        if not self._can_drone_start_mode_c_from_depot(drone, depot):
+            return None
+
         energy_out = self._flight_energy(drone, depot.location, order.delivery_loc, order.payload_weight)
         energy_back = self._flight_energy(drone, order.delivery_loc, depot.location, 0.0)
         energy_needed = (energy_out + energy_back) * self.ENERGY_SAFETY_FACTOR
@@ -1996,9 +2068,26 @@ class MarketBasedSolver(GreedyMMCE):
 
     def _is_drone_physically_on_truck(self, drone: "Drone", truck: "Truck") -> bool:
         """与 decision_engine_market 相同语义：docked 或 transport_truck_id 视为在目标卡车上。"""
+        if drone.status.is_flying:
+            return False
+        if getattr(drone, "waiting_recovery_station_id", ""):
+            return False
         if drone.drone_id in getattr(truck, "docked_drones", []):
             return True
         return getattr(drone, "transport_truck_id", None) == truck.truck_id
+
+    def _can_drone_start_mode_c_from_depot(self, drone: "Drone", depot: Any) -> bool:
+        """Mode C 要求无人机真实可从仓库起飞，防止“仓-空直递”幻觉分配。"""
+        if getattr(drone, "transport_truck_id", None):
+            return False
+        if getattr(drone, "waiting_recovery_station_id", ""):
+            return False
+        for truck in self.entity_mgr.trucks.values():
+            if drone.drone_id in getattr(truck, "docked_drones", []):
+                return False
+        if self._dist(drone.current_loc, depot.location) > self.MODE_C_DEPOT_TOLERANCE_M:
+            return False
+        return True
 
     def _collect_anchor_bids_for_drone(
         self,

@@ -23,6 +23,7 @@ logger = logging.getLogger("solver.decision_engine_market")
 
 class MarketDispatchDecisionEngine(DispatchDecisionEngine):
     """MarketBasedSolver 专用编排器。"""
+    MODE_C_DEPOT_TOLERANCE_M = 25.0
 
     def __init__(
         self,
@@ -66,9 +67,32 @@ class MarketDispatchDecisionEngine(DispatchDecisionEngine):
         super()._apply_plan(plan, current_time, incremental=incremental)
 
     def _sanitize_market_allocations(self, plan: DispatchPlan, current_time: float) -> None:
-        """禁止把未真实在目标卡车上的无人机瞬间加入卡车负载。"""
+        """执行前校验分配的物理一致性，避免幽灵挂载与仓库幻觉起飞。"""
         for alloc in plan.allocations:
-            if not alloc.feasible or alloc.mode not in ("B_WAIT", "B_DYNAMIC"):
+            if not alloc.feasible or not alloc.drone_id:
+                continue
+
+            if alloc.mode == "C":
+                if getattr(alloc, "_is_relay", False):
+                    continue
+                if self._drone_can_start_mode_c_from_depot(alloc.drone_id, alloc.vehicle_id):
+                    continue
+                alloc.feasible = False
+                alloc.reason = "market执行层拒绝：Mode C 无人机未满足仓库起飞条件"
+                logger.warning(
+                    "[MarketDispatchDecisionEngine] 拒绝订单 %s 的 Mode C 分配："
+                    "drone=%s 未满足 depot=%s 的真实起飞条件",
+                    alloc.order_id,
+                    alloc.drone_id,
+                    alloc.vehicle_id,
+                )
+                order = self.order_mgr.assigned_orders.get(alloc.order_id)
+                if order is not None and order.status == TaskStatus.ASSIGNED:
+                    self.order_mgr.assigned_orders.pop(alloc.order_id, None)
+                    self.order_mgr.pending_orders[alloc.order_id] = order
+                continue
+
+            if alloc.mode not in ("B_WAIT", "B_DYNAMIC"):
                 continue
 
             truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
@@ -116,9 +140,29 @@ class MarketDispatchDecisionEngine(DispatchDecisionEngine):
         drone = self.entity_mgr.drones.get(drone_id)
         if truck is None or drone is None:
             return False
+        if drone.status.is_flying:
+            return False
+        if getattr(drone, "waiting_recovery_station_id", ""):
+            return False
         if drone_id in getattr(truck, "docked_drones", []):
             return True
         return getattr(drone, "transport_truck_id", "") == truck_id
+
+    def _drone_can_start_mode_c_from_depot(self, drone_id: str, depot_id: str) -> bool:
+        drone = self.entity_mgr.drones.get(drone_id)
+        depot = self.entity_mgr.depots.get(depot_id)
+        if drone is None or depot is None:
+            return False
+        if getattr(drone, "transport_truck_id", None):
+            return False
+        if getattr(drone, "waiting_recovery_station_id", ""):
+            return False
+        for truck in self.entity_mgr.trucks.values():
+            if drone_id in getattr(truck, "docked_drones", []):
+                return False
+        if drone.current_loc.distance_2d(depot.location) > self.MODE_C_DEPOT_TOLERANCE_M:
+            return False
+        return True
 
     def _release_contract_for_rejected_allocation(self, alloc: AllocationResult) -> None:
         """释放已授标但执行层拒绝的 B_WAIT 契约，避免无人机被幽灵契约锁定。"""
@@ -221,20 +265,45 @@ class MarketDispatchDecisionEngine(DispatchDecisionEngine):
             logger.warning("[MarketDispatchDecisionEngine] 回收点 %s 不存在", recovery_id)
             return
 
+        current_carry = getattr(drone, "carrying_order_id", None)
+        current_pending = getattr(drone, "pending_release_order_id", None)
+        if current_carry and current_carry != alloc.order_id:
+            logger.warning(
+                "[MarketDispatchDecisionEngine] 跳过无人机 %s 的 %s 路由："
+                "已携带订单 %s，拒绝改派到 %s",
+                alloc.drone_id,
+                alloc.mode,
+                current_carry,
+                alloc.order_id,
+            )
+            return
+        if current_pending and current_pending != alloc.order_id:
+            logger.warning(
+                "[MarketDispatchDecisionEngine] 跳过无人机 %s 的 %s 路由："
+                "仍在完成订单 %s，拒绝改派到 %s",
+                alloc.drone_id,
+                alloc.mode,
+                current_pending,
+                alloc.order_id,
+            )
+            return
+
         waypoints = [
             RouteWaypoint(launch_station.location, WaypointAction.PICKUP, alloc.order_id),
             RouteWaypoint(order.delivery_loc, WaypointAction.DELIVER, alloc.order_id),
             RouteWaypoint(recovery_entity.location, dock_action, recovery_id),
         ]
+        if not current_carry:
+            try:
+                drone.assign_order(alloc.order_id, order.payload_weight)
+            except ValueError as exc:
+                logger.warning(
+                    "[MarketDispatchDecisionEngine] 为无人机 %s 分配订单失败: %s",
+                    alloc.drone_id,
+                    exc,
+                )
+                return
         drone.set_route(waypoints)
-        try:
-            drone.assign_order(alloc.order_id, order.payload_weight)
-        except ValueError as exc:
-            logger.warning(
-                "[MarketDispatchDecisionEngine] 为无人机 %s 分配订单失败: %s",
-                alloc.drone_id,
-                exc,
-            )
 
         if order.status == TaskStatus.ASSIGNED:
             order.update_status(TaskStatus.PICKED_UP)
