@@ -371,6 +371,12 @@ class EntityManager:
                     # 通过平移 departure_time 冻结里程推进，避免恢复后瞬移。
                     truck._departure_time += dt
                     truck.status = TruckStatus.WAITING
+                    # 在停靠窗口内每帧重试：无人机落地晚于“到达时刻表首帧”时，需在 WAITING 内持续回收。
+                    w_type = str(wait_stop.get("node_type", ""))
+                    if w_type in ("recovery", "station"):
+                        w_sid = str(wait_stop.get("node_id", ""))
+                        if w_sid:
+                            self._recover_drones_from_station_to_truck(truck, w_sid, current_time)
                 else:
                     if truck._route_data and truck.status.value == "WAITING":
                         from core.entities.primitives import TruckStatus
@@ -528,6 +534,10 @@ class EntityManager:
             except Exception:
                 logger.exception("[EntityManager.tick_all] Drone %s tick 异常", drone.drone_id)
 
+        # 本帧内卡车先于无人机步进，若上一步无法回收，无人机落地后在此再试（仍要求车在站边）。
+        for truck in self.trucks.values():
+            self._poll_station_recovery_after_drones(truck, current_time)
+
     def _process_truck_route_events(
         self,
         truck: Truck,
@@ -574,14 +584,14 @@ class EntityManager:
         truck._planned_route_cursor = cursor
 
     def _get_truck_wait_stop(self, truck: Truck, current_time: float) -> Optional[dict]:
-        """返回当前时刻卡车应等待的节点（customer/recovery），否则返回 None。"""
+        """返回当前时刻卡车应等待的节点（customer / recovery / 经停充电 station），否则返回 None。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
             return None
 
         for stop in planned_stops:
             node_type = stop.get("node_type", "")
-            if node_type not in {"customer", "recovery"}:
+            if node_type not in {"customer", "recovery", "station"}:
                 continue
             arrival = float(stop.get("arrival_time", float("inf")))
             departure = float(stop.get("departure_time", arrival))
@@ -629,21 +639,47 @@ class EntityManager:
             if station_id:
                 self._recover_drones_from_station_to_truck(truck, station_id, current_time)
 
+    def _poll_station_recovery_after_drones(self, truck: Truck, current_time: float) -> None:
+        """在无人机本帧位姿/状态已更新后，对仍在站边且时间窗内（或仍有等回收机）的站点再尝试回收。"""
+        planned = getattr(truck, "_planned_route_stops", None)
+        if not planned:
+            return
+        for stop in planned:
+            nt = str(stop.get("node_type", ""))
+            if nt not in ("recovery", "station"):
+                continue
+            sid = str(stop.get("node_id", ""))
+            if not sid:
+                continue
+            arr = float(stop.get("arrival_time", 0.0))
+            dep = float(stop.get("departure_time", arr))
+            if current_time + 1e-6 < arr:
+                continue
+            if not self._truck_is_near_stop(truck, stop):
+                continue
+            if current_time > dep + 1e-6:
+                if not any(
+                    getattr(d, "waiting_recovery_station_id", "") == sid
+                    for d in self.drones.values()
+                ):
+                    continue
+            self._recover_drones_from_station_to_truck(truck, sid, current_time)
+
     def _recover_drones_from_station_to_truck(
         self,
         truck: Truck,
         station_id: str,
         current_time: float,
     ) -> None:
-        """卡车到达回收站点后，将在站点等待的无人机回收到车上。"""
-        from core.entities.primitives import DroneStatus
+        """卡车在站点时，将已落地等待回收（waiting_recovery_station_id）的机写入车载 docked_drones。
 
+        使用「非在飞」判断而非仅 IDLE：与 tick 顺序解耦，避免与 station.tick 的 CHARGING 等状态冲突。
+        """
         recovered: list[str] = []
         for drone in self.drones.values():
-            waiting_station_id = getattr(drone, "waiting_recovery_station_id", "")
-            if waiting_station_id != station_id:
+            if getattr(drone, "waiting_recovery_station_id", "") != station_id:
                 continue
-            if drone.status != DroneStatus.IDLE:
+            if drone.status.is_flying:
                 continue
 
             drone.waiting_recovery_station_id = ""

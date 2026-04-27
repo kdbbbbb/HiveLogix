@@ -34,6 +34,7 @@ from entity_manager import EntityManager
 from order_manager import OrderManager
 from sim_engine import SimulationEngine
 from solver.decision_engine import DispatchDecisionEngine
+from solver.decision_engine_market import MarketDispatchDecisionEngine
 from utils.coord_utils import utm_to_wgs84
 
 # 导入预设场景模块
@@ -59,6 +60,25 @@ _dispatch_engine: DispatchDecisionEngine | None = None
 # 注册 WebSocket 遥测端点，并将 sim_engine 的完整快照构造函数注入 telemetry 模块
 register_route(sock)
 set_snapshot_builder(_sim_engine.build_full_snapshot)
+
+
+def _ensure_dispatch_engine_for_solver(solver_name: str) -> DispatchDecisionEngine:
+    """按 solver 选择通用或 market 专用编排器。"""
+    global _dispatch_engine
+
+    target = solver_name.strip().lower()
+    if target == "market":
+        if not isinstance(_dispatch_engine, MarketDispatchDecisionEngine):
+            _dispatch_engine = MarketDispatchDecisionEngine(_entity_mgr, _order_mgr)
+            logger.info("[sim_dispatch] 已切换到 MarketDispatchDecisionEngine")
+    else:
+        if _dispatch_engine is None or isinstance(_dispatch_engine, MarketDispatchDecisionEngine):
+            _dispatch_engine = DispatchDecisionEngine(_entity_mgr, _order_mgr)
+            logger.info("[sim_dispatch] 已切换到通用 DispatchDecisionEngine")
+
+    if _dispatch_engine is None:
+        _dispatch_engine = DispatchDecisionEngine(_entity_mgr, _order_mgr)
+    return _dispatch_engine
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -710,6 +730,8 @@ def sim_dispatch():
         "timestamp": <float>
       }
     """
+    global _dispatch_engine
+
     if not _dispatch_engine:
         return jsonify({"error": "调度引擎未初始化，请先调用 /api/sim/init"}), 409
 
@@ -720,6 +742,12 @@ def sim_dispatch():
 
     logger.debug(f"[sim_dispatch] 收到请求体: {body}")
 
+    if not bbox or not all(k in bbox for k in ["minx", "miny", "maxx", "maxy"]):
+        logger.error(f"[sim_dispatch] bbox 缺失或格式错误: {bbox}")
+        return jsonify({"error": "缺少 bbox 参数"}), 400
+
+    _dispatch_engine = _ensure_dispatch_engine_for_solver(str(solver))
+
     try:
         _dispatch_engine.set_solver(str(solver))
     except ValueError as exc:
@@ -728,19 +756,17 @@ def sim_dispatch():
             "available_solvers": _dispatch_engine.get_available_solvers(),
         }), 400
 
-    if not bbox or not all(k in bbox for k in ["minx", "miny", "maxx", "maxy"]):
-        logger.error(f"[sim_dispatch] bbox 缺失或格式错误: {bbox}")
-        return jsonify({"error": "缺少 bbox 参数"}), 400
-
     try:
         current_time = _sim_engine.current_time
         plan = _dispatch_engine.execute(current_time, bbox, scene_id=scene_id)
 
         # 首次调度后注册自动增量调度，使后续动态订单能被自动处理
-        if _sim_engine._dispatch_engine is None:
+        if _sim_engine._dispatch_engine is not _dispatch_engine:
+            first_attach = _sim_engine._dispatch_engine is None
             _sim_engine.attach_dispatch_engine(_dispatch_engine, bbox, scene_id=scene_id)
-            # 初始化快照为当前已分配的订单，避免下一帧重复调度
-            _sim_engine._pending_snapshot = set(_order_mgr.pending_orders.keys())
+            if first_attach:
+                # 初始化快照为当前已分配的订单，避免下一帧重复调度
+                _sim_engine._pending_snapshot = set(_order_mgr.pending_orders.keys())
 
         truck_routes = {
             truck_id: _serialize_truck_route(route)

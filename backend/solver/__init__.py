@@ -9,6 +9,7 @@ HiveLogix — 求解层
 """
 
 from solver.decision_engine import DispatchDecisionEngine
+from solver.decision_engine_market import MarketDispatchDecisionEngine
 from solver.factory import create_solver, list_solvers, register_solver
 from solver.greedy_mmce import GreedyMMCE
 from solver.greedy_mmce_bi import GreedyMMCEBackboneInsertion
@@ -20,6 +21,7 @@ __all__ = [
     "GreedyMMCEBackboneInsertion",
     "MarketBasedSolver",
     "DispatchDecisionEngine",
+    "MarketDispatchDecisionEngine",
     "DispatchSolver",
     "create_solver",
     "register_solver",

@@ -19,19 +19,19 @@
 
 ### 优化目标（最小化什么）
 
-对**每一次授标**，比较的是投标上的 **`score_total`**（标量，越小越好）。其组成因模式而异（详见 §10）：
+对**每一次授标**，比较的是投标上的 **`score_total`**（标量，越小越好）。**当前实现**在竞价目标上**只保留**与基线一致的三项，便于对照与调试：
 
 | 组成部分 | 典型含义 | 写入 `AllocationResult` 的字段 |
 |----------|----------|----------------------------------|
 | `cost_dist` | 距离加权：卡车段（含边际或全量口径）+ UAV 航段 | `cost_dist` |
 | `cost_energy` | 能耗加权：与上对应的卡车 / UAV 能耗 | `cost_energy` |
-| `cost_penalty` | 时间窗违约：`LAMBDA_TIME × penalty_rate × max(0, ETA − deadline)` | `cost_penalty` |
-| `cost_wait` / `cost_risk` | B/B_WAIT：**机等车 / 车等机**非对称等待；贴近锚点**生死线**的风险溢价 | **仅**进 `score_total`，不进三成本字段 |
-| `cost_backtrack` / 边际绕路能耗附加 / `path_bonus` | 市场层方向性：**回头路惩罚**、绕路能耗放大、**顺路邻近奖励**（减分） | 同上，仅影响授标 |
+| `cost_penalty` | 时间窗违约：`(λ_cfg × 1.5) × penalty_rate × max(0, ETA − deadline)`；其中 `λ_cfg` 为 `solver_energy.lambda_time`（`drone_params.yaml`），**1.5** 为 `MarketBasedSolver.TIME_PENALTY_WEIGHT_MULT` | `cost_penalty` |
 
-**计划级汇总**（`_recalculate_actual_plan_costs`）：按本轮最终 **`truck_routes` 全量里程**与 UAV 几何航段重算 `plan.cost_total` 与 `summary["cost_breakdown"]`**，不把**上述仅用于竞价的附加项（`cost_wait`、`cost_risk`、回头路等）**摊入该汇总，避免与真实执行账本重复或口径混淆。
+**暂不**计入（代码中已不进入 `score_total`；保留辅助函数/常量备后续恢复）：`cost_wait` / `cost_risk`（B/B_WAIT 协同等待与生死线风险）、`cost_backtrack` / 边际绕路能耗放大 / `path_bonus`（市场层方向性修正）。
 
-一句话：**拍卖阶段最小化「加权距离 + 能耗 + 迟罚 + 协同与时间风险 + 方向性修正」的标量 `score_total`；回传计划后再用真实路径重算账本成本。**
+**计划级汇总**（`_recalculate_actual_plan_costs`）：按本轮最终 **`truck_routes` 全量里程**与 UAV 几何航段重算 `plan.cost_total` 与 `summary["cost_breakdown"]`（**不含**上表未实现的竞价附加项，避免与真实执行账本重复或口径混淆）。
+
+一句话：**拍卖阶段当前最小化「加权距离 + 能耗 + 时间窗迟罚」的标量 `score_total`；回传计划后再用真实路径重算账本成本。**
 
 ### 决策变量（每一单在选什么）
 
@@ -265,11 +265,11 @@ flowchart TB
 
 **增量与不可变更订单**：增量入口会先过滤掉已进入履约临界点的订单（见 §4），`summary["auction_stats"]["immutable_orders_skipped"]` 记录本轮跳过的单数；这些订单不再进入拍卖池，避免与「唯一履约权」冲突。
 
-**仿真层接入**：`DispatchDecisionEngine` 提供 `execute_incremental(new_orders, current_time, bbox, scene_id)` 方法，自动调用 `dispatch_incremental` 并应用分配方案。`try_fulfill_contracts(current_time)` 可在每个仿真 tick 中调用，自动兑现已完成回收的契约。
+**仿真层接入**：`MarketDispatchDecisionEngine`（`backend/solver/decision_engine_market.py`）是 market 专用编排器，提供 `execute_incremental(new_orders, current_time, bbox, scene_id)` 方法，自动调用 `dispatch_incremental` 并应用分配方案。`try_fulfill_contracts(current_time)` 可在每个仿真 tick 中调用，但只有无人机真实进入目标卡车 `docked_drones` 后才兑现契约。非 market 求解器仍使用通用 `DispatchDecisionEngine`。
 
 **实体层与订单池**：`EntityManager.tick_all(current_time, dt, order_mgr)` 由 `SimulationEngine` 传入 `OrderManager`，仅用于配送完成时的订单归档；实体容器不再持有 `order_mgr` 字段。市场求解器对订单状态的读取见上文 `bind_order_manager`。
 
-**总体能耗/成本汇总不变**：`_recalculate_actual_plan_costs` 仍按真实 `truck_routes` 全量距离与 UAV 航段重算 `plan.cost_total` 与 `summary["cost_breakdown"]`，公式与贪心基线一致；**不**把竞价用的 `cost_wait` / `cost_risk` 计入 `cost_dist` / `cost_energy` / `cost_penalty`。
+**总体能耗/成本汇总不变**：`_recalculate_actual_plan_costs` 仍按真实 `truck_routes` 全量距离与 UAV 航段重算 `plan.cost_total` 与 `summary["cost_breakdown"]`，公式与贪心基线一致。竞价目标当前亦仅与三字段一致，无额外项需摊分。
 
 **每轮收尾（全量与增量共用）**：在 `_revoke_stale_drone_assignments` 之后依次调用：
 
@@ -297,7 +297,7 @@ flowchart TB
 
 - `_expire_contracts(current_time)`：在每次 `dispatch` / `dispatch_incremental` 开头执行，`current_time > latest_departure` 的活跃契约标为 `expired`。
 - `_try_flexible_recovery(current_time)`：紧随 `_expire_contracts` 之后执行。若无人机等待卡车的剩余时间 > 飞回仓库时间，且电量安全可达仓库，则将契约标为 `released`，释放无人机锁定。
-- `fulfill_contract(contract_id)`：供仿真/决策引擎在回收完成后调用，将契约标为 `fulfilled`。`DispatchDecisionEngine.try_fulfill_contracts` 提供自动化调用。
+- `fulfill_contract(contract_id)`：供仿真/决策引擎在回收完成后调用，将契约标为 `fulfilled`。`MarketDispatchDecisionEngine.try_fulfill_contracts` 提供自动化调用，并要求 `drone_id in truck.docked_drones`、`drone.transport_truck_id == truck_id` 且 `waiting_recovery_station_id` 已清空，避免把“已落地站点等待卡车”误判为“已回收到车上”。
 
 ---
 
@@ -364,9 +364,9 @@ flowchart TB
 |-------------|------|
 | **`_find_best_insertion_for_truck`** | 基于 `_planned_route_stops` 中「当前 cursor 之后」的停靠序列，枚举在相邻停靠点之间的插入间隙；对每一间隙计算相对原路径的**额外行驶距离**与 `detour_time`，并将契约锚点对应停靠的 `arrival_time` 整体平移 `detour_time` 后与 `latest_departure` 比较。取**绕路时间最小**的可行间隙；无计划停靠时退化为单段「当前位置 → 客户」并与各契约锚点 ETA 校验。 |
 | **`_validate_truck_insertion`** | 有活跃契约时：若 `_find_best_insertion_for_truck` 无可行间隙则返回 `False`；无契约时恒为 `True`。**不再**用「当前位置 → 客户 → 各锚点」单一路径替代全部插入可能。 |
-| **`_point_to_segment_distance`** | 订单点到卡车**未来路径折线段**（相邻 planned stop 连线）的最短 2D 距离，供邻近度奖励使用。 |
-| **`_compute_backtrack_penalty`** | 用「卡车当前位置 → 下一 planned 停靠」为前进方向，与「卡车当前位置 → 客户」夹角余弦；若订单在**身后**（cos \< 0），按偏离程度与距离加权惩罚（`BACKTRACK_PENALTY_WEIGHT`），进入竞价 `score_total`。 |
-| **`_compute_path_proximity_bonus`** | 订单越靠近上述路径折线，奖励越大（从总分中**减去**，鼓励顺路单）。 |
+| **`_point_to_segment_distance`** | 订单点到卡车**未来路径折线段**（相邻 planned stop 连线）的最短 2D 距离；原用于 `path_bonus`，**当前**不进入 `score_total`。 |
+| **`_compute_backtrack_penalty`** | 用「卡车当前位置 → 下一 planned 停靠」为前进方向，与「卡车当前位置 → 客户」夹角余弦；若订单在**身后**（cos \< 0）按 `BACKTRACK_PENALTY_WEIGHT` 惩罚；**当前**不进入 `score_total`（见 §10），保留供后续恢复。 |
+| **`_compute_path_proximity_bonus`** | 距路径折线越近奖励越大；**当前**不进入 `score_total`，保留供后续恢复。 |
 | **`_optimize_route_2opt`** | 对 **`TruckRoute`** 中间节点做 **2-opt** 反转边，缩短总长；**首尾节点固定**；`locked_anchor_ids`（如契约必经回收站）对应节点下标**不参与交换**。优化后按卡车 `speed` 重算各节点 `arrival_time` / `departure_time`、`total_distance` 与 `geometry`。 |
 | **`_prepare_anchor_preview_routes`** | 在 `_build_truck_route` 得到预览路线后，对每车以**该车活跃契约的 `anchor_id` 集合**为锁定集调用 `_optimize_route_2opt`，再写入 `_anchor_preview_routes`；若里程明显下降打 INFO 日志。 |
 
@@ -415,6 +415,13 @@ flowchart TB
 - `order_mgr.assigned_orders` 为空。
 
 `_validate_truck_premature_return(plan)`：若计划末节点为回仓 depot 且上述清空条件不满足，打警告日志（不自动改计划，避免与基线路由构建强耦合）。
+
+### 7.4 Market 专用执行不变量
+
+`MarketDispatchDecisionEngine` 负责把市场求解结果落到实体状态，并保持以下执行不变量：
+
+- `truck.docked_drones` 只能表示真实停靠在卡车上的无人机。Market 编排器不会在 `B_WAIT` / `B_DYNAMIC` 分配瞬间把任意无人机加入卡车负载；若无人机未真实在目标卡车上，该分配会在应用计划前被转为不可行。
+- `B_WAIT` 契约只有在无人机真实进入目标卡车负载后兑现；无人机刚到 `recovery_station_id` 充电站时只会处于 `waiting_recovery_station_id` 状态，不会提前 fulfilled。
 
 ---
 
@@ -468,32 +475,21 @@ flowchart TB
 ### 10.1 Mode A / C
 
 - **C**：使用基线 `_score_allocation`（`f_dist + f_energy + f_penalty`）。
-- **A**：同样经 `_score_allocation` 得到三成本字段与初始 `score_total`，再在 **`_score_standard_bid`** 中叠加 §10.2.1 的方向性项（仅改变授标用 `score_total`）。
+- **A**：经 `_score_allocation` 得到三成本与 `score_total`；**当前**在 `_score_standard_bid` 中**不再**叠加原 §10.2.1 的方向性/绕路/邻近奖，授标用 `score_total` 与基线一致（仅距离 + 能耗 + 时间窗迟罚）。
 
 ### 10.2 Mode B / B_WAIT（`_score_market_b_bid`）
 
-- **基础项（写入 `cost_dist` / `cost_energy` / `cost_penalty`）**：与原先一致 — UAV 全量距离/能耗；卡车仅 **边际** 距离（锚点均在当前时刻表内则为 0）；超时惩罚同基线 `LAMBDA_TIME × penalty_rate × lateness`。
-- **竞价附加项（仅进入 `score_total`，不写入上述三字段）**：
-  - **非对称等待**：`truck_arrival_at_recovery` 与 `uav_arrival_at_recovery` 比较；若卡车晚到（机等车）`cost_wait = (OMEGA_UAV_IDLE + OPPORTUNITY_COST_PER_SEC) × (T_truck - T_uav)`（含机会成本）；若卡车早到（车等机）`cost_wait = OMEGA_TRUCK_IDLE × |T_uav - T_truck|`。
-  - **生死线风险**：`margin = latest_rendezvous - uav_arrival`，`risk_ratio = 1 - min(margin / T_MAX_WAIT, 1)`，`cost_risk = DEADLINE_RISK_WEIGHT × risk_ratio × (cost_dist + cost_energy)`。
+- **当前授标式**：`score_total = cost_dist + cost_energy + cost_penalty`（与 B_DYNAMIC 同形）。
+- **三字段含义**：UAV 全量距离/能耗；卡车仅 **边际** 距离（锚点均在当前时刻表内则为 0）；超时惩罚 `LAMBDA_TIME × penalty_rate × lateness`。
+- **暂停计入 `score_total` 的项**（实现中已去掉；类内仍保留 `_compute_backtrack_penalty`、`_compute_path_proximity_bonus` 与相关常量，便于恢复）：`cost_wait`、`cost_risk`、`cost_backtrack`、`cost_detour_energy`、`path_bonus`（原公式见本文件历史版本或 git）。
 
-**竞价附加项（续，仍只计入 `score_total`）**：
+### 10.2.1 Mode A（方向性项 — 已暂停）
 
-- **`cost_backtrack`**：`_compute_backtrack_penalty` — 订单相对卡车**下一 planned 停靠**前进方向若落在身后，增加惩罚，抑制「拍卖驱动下的回头路」。
-- **`cost_detour_energy`**：当卡车边际距离 `truck_distance > 0` 时，对 `_truck_energy_wh(truck_distance)` 乘以 `(DETOUR_ENERGY_MULTIPLIER - 1)` 再乘 `C_ENERGY_ET`，作为绕路/变向的额外能耗项。
-- **`path_bonus`**：`_compute_path_proximity_bonus` — 订单贴近未来路径折线时从总分中**减去**该项，奖励顺路协同。
-
-`score_total = cost_dist + cost_energy + cost_penalty + cost_wait + cost_risk + cost_backtrack + cost_detour_energy - path_bonus`。
-
-### 10.2.1 Mode A（`_score_standard_bid` 中叠加）
-
-在基线 `_score_allocation` 得到的 `score_total` 基础上，对 **Mode A** 再叠加与 B/B_WAIT 同口径的 **`cost_backtrack`**、基于 **`_find_best_insertion_for_truck`** 返回的 `detour_time` 折算距离后的 **`cost_detour_energy`**，并减去 **`path_bonus`**。`cost_dist` / `cost_energy` / `cost_penalty` 三字段仍来自基线，便于与计划级汇总对齐。
+~~曾在 `_score_standard_bid` 中对 Mode A 在基线分上叠加重项~~；**当前**已不叠加，见 §10.1。
 
 ### 10.3 Mode B_DYNAMIC（`_score_b_dynamic_bid`）
 
 - **基础项**：UAV 全量距离/能耗（launch→customer→depot）；卡车仅边际距离（launch 锚点在时刻表内则为 0）。
-- **无 `cost_wait`**（无人机直飞仓库，不等卡车）。
-- **无 `cost_risk`**（不依赖锚点生死线）。
 
 `score_total = cost_dist + cost_energy + cost_penalty`。
 
@@ -507,7 +503,7 @@ flowchart TB
 
 | 常量 | 默认值 | 含义 |
 |------|--------|------|
-| `T_MAX_WAIT` | 60.0 s | 锚点最大等待窗口（与节点时间推导配合使用） |
+| `T_MAX_WAIT` |300.0 s | 锚点最大等待窗口（与节点时间推导配合使用） |
 | `OMEGA_UAV_IDLE` | 0.5 | 机等车等待惩罚权重 |
 | `OMEGA_TRUCK_IDLE` | 1.0 | 车等机等待惩罚权重 |
 | `OPPORTUNITY_COST_PER_SEC` | 0.1 | 机等车的额外机会成本（每秒） |
@@ -522,6 +518,8 @@ flowchart TB
 | `TWO_OPT_MAX_ITERATIONS` | 50 | 预览路线 2-opt 局部搜索迭代上限 |
 
 `TRUCK_DRONE_LAUNCH_TIME`、`TRUCK_DRONE_RECOVER_TIME`、`delivery_service_time`、`ENERGY_SAFETY_FACTOR` 等仍由基线/配置 `drone_params.yaml` 的 `solver_energy` 覆盖。
+
+| `TIME_PENALTY_WEIGHT_MULT` | 1.5 | 在 `λ_cfg` 之上放大时间窗迟罚（`self.LAMBDA_TIME = λ_cfg × 本项`） |
 
 ---
 
@@ -549,9 +547,9 @@ flowchart TB
 - **B_DYNAMIC 混合投标**：站点起飞 + 仓库回收，解决卡车远离仓库但订单靠近仓库时的协同效率问题。
 - **评分权重校正**：缩小机等车/车等机的极端不对称性，引入机会成本，降低风险溢价以减少保守退化。
 - **插单与 UAV 协同解耦**：Mode A / 车队安全仍使用 `_validate_truck_insertion`（**多间隙最优插入**）+ `_validate_truck_fleet_safety`；**B_WAIT / B 锚点投标**不再误用「卡车必去客户」的插单模型，与 `_build_anchor_bid` 的 sync 校验分工明确。
-- **路径方向性与多维竞价**：B/B_WAIT 的 `score_total` 叠加回头路惩罚、边际绕路能耗放大、路径邻近奖励；Mode A 在基线分上叠加同系方向性项。
+- **路径方向性与多维竞价（竞价目标已简化）**：B/B_WAIT / Mode A 的 `score_total` **当前**仅距离+能耗+迟罚；方向性/等待/风险等项保留在代码中待恢复，仍可用于 2-opt 等路径局部优化，但不进入 `score_total`。
 - **预览主干 2-opt**：全量预览路线在写入 `_anchor_preview_routes` 前对中间节点做 2-opt，契约锚点锁定不交换，减少回头路里程。
-- **增量调度仿真层接入**：`DispatchDecisionEngine.execute_incremental` 和 `try_fulfill_contracts` 已可用。
+- **增量调度仿真层接入**：market 使用 `MarketDispatchDecisionEngine.execute_incremental` 和严格版 `try_fulfill_contracts`；greedy 等其他求解器仍使用通用 `DispatchDecisionEngine`。
 
 ---
 
@@ -561,6 +559,14 @@ flowchart TB
 - **`dispatch_incremental` 与预览**：若已有 `_planned_route_stops` 则本轮可能不重建 `_anchor_preview_routes`，此时依赖 `_build_anchor_timetable` 的运行时计划 + 契约合并。
 - **`should_truck_return_to_depot`**：为保守全局条件，可能与「单车清空即可回仓」的产品定义不完全一致；若需按车过滤 assigned 订单，可在后续版本收紧/放宽条件并与路线构建联动。
 - **插值补全**：`_needs_interpolation` 仅标记意图，实际几何插值需在 `decision_engine` 或实体层消费该标记后实现。
+- **非车载接驳建模**：当前 market 执行层第一阶段只允许已真实在目标卡车上的无人机执行 `B_WAIT` / `B_DYNAMIC` 站点起飞任务。若要支持无人机先飞到某站点再被卡车接上，需要在求解器投标准入与时间估计中显式计入该接驳航段。
+
+### 15.1 回归验证建议
+
+- **Market / B_DYNAMIC**：1 辆卡车 + 1 架初始车载无人机，验证卡车到 `launch_station_id` 后无人机才从 `docked_drones` 移除并起飞，送货后回仓。
+- **Market / B_WAIT**：无人机送货后落到 `recovery_station_id`，卡车未到站前仅设置 `waiting_recovery_station_id`，契约保持 active；卡车到站回收后才进入 `docked_drones` 并 fulfilled。
+- **非车载拒绝**：无人机不在目标卡车上时，market 执行层应将对应 `B_WAIT` / `B_DYNAMIC` 分配转为不可行，不应修改 `truck.docked_drones`。
+- **Greedy 回归**：`greedy` / `greedy_mmce` 仍走通用 `DispatchDecisionEngine`，Mode B/C 的既有路径和订单状态推进不变。
 
 ---
 
@@ -571,10 +577,10 @@ flowchart TB
 | 无人机投标 | 从「仅 IDLE」扩展为 IDLE + RETURNING 串联 + DELIVERING 预调度；PICKUP/装卸等锁定不参与。 |
 | 增量调度 | 过滤 `PICKED_UP` / `DELIVERING` / `COMPLETED` 订单；统计 `immutable_orders_skipped`。 |
 | 改派清理 | `_revoke_stale_drone_assignments` 尊重不可撤销与飞行中 carrying，可否定中标 `feasible`。 |
-| 卡车 Mode A | 增加车队安全校验；插单与绕路时间改为**最优插入** + 与 B 系一致的方向性评分项。 |
+| 卡车 Mode A | 增加车队安全校验；插单与绕路时间改为**最优插入**；竞价用 `score_total` 现与基线三成本一致。 |
 | 插单 / B_WAIT | `_validate_truck_insertion` 改为多间隙搜索；**B_WAIT 锚点投标**移除错误的卡车客户绕路前置校验。 |
 | 预览路线 | 构建后对 `TruckRoute` 做 **2-opt**（锁定契约站）。 |
-| 评分 | B/B_WAIT 增加 `cost_backtrack`、`cost_detour_energy`、`path_bonus`；Mode A 叠加同系列。 |
+| 评分 | 竞价用 `score_total` 现仅三成本；原等待/风险/方向性项暂停。 |
 | 路径 | 前瞻 \(\Delta t\)、串联间隙标记、对外 `validate_path_continuity`。 |
 | 收尾 | 路径闭环日志、卡车提前回仓告警、空闲机自动归巢。 |
 

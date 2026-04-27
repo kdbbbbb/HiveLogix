@@ -33,10 +33,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from core.entities.primitives import DroneStatus
+from core.entities.primitives import DroneStatus, SourceType
 from solver.greedy_mmce import (
     AllocationResult,
     DispatchPlan,
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _ENTITY_MANAGER_LOGGER = logging.getLogger("entity_manager")
 _DECISION_ENGINE_LOGGER = logging.getLogger("solver.decision_engine")
+_MARKET_DECISION_ENGINE_LOGGER = logging.getLogger("solver.decision_engine_market")
 
 # 与本模块在终端上的 logging 输出一致，追加写入 solver 目录下的 market_debug_log
 _MARKET_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_debug_log")
@@ -104,6 +106,7 @@ def _ensure_market_debug_file_handler() -> None:
     # entity_manager：配送点停留与完成归档。
     _attach_market_debug_file_handler(logger)
     _attach_market_debug_file_handler(_DECISION_ENGINE_LOGGER)
+    _attach_market_debug_file_handler(_MARKET_DECISION_ENGINE_LOGGER)
     _attach_market_debug_file_handler(_ENTITY_MANAGER_LOGGER)
 
 
@@ -147,7 +150,7 @@ class RendezvousContract:
 class MarketBasedSolver(GreedyMMCE):
     """基于锚点时刻表的单任务顺序拍卖调度器，支持动态增量拍卖与时空契约。"""
 
-    T_MAX_WAIT = 60.0
+    T_MAX_WAIT = 300.0
 
     # 非对称等待惩罚权重（已校正：缩小机等车/车等机的极端不对称性）
     OMEGA_UAV_IDLE = 0.5         # 机等车：含机会成本（无法投标新单）
@@ -170,8 +173,16 @@ class MarketBasedSolver(GreedyMMCE):
     PATH_PROXIMITY_BONUS = 0.3           # 路径邻近度奖励权重（订单在卡车路径附近时减分）
     TWO_OPT_MAX_ITERATIONS = 50          # 2-opt 局部搜索最大迭代次数
 
+    # 单车市场场景：驶出仓时车载 9 架、仓内留 3 架（与 UAV-TEST-xx 编号尾数对应，在此由求解器首调度前写回实体）
+    MARKET_TRUCK_DRONE_INDEXES = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 11})
+    MARKET_DEPOT_DRONE_INDEXES = frozenset({9, 10, 12})
+
+    # 在 `solver_energy.lambda_time` 基础上再放大时间窗迟罚，仅作用于 market 竞价/基线分中的 `cost_penalty`
+    TIME_PENALTY_WEIGHT_MULT = 1.5
+
     def __init__(self, entity_mgr) -> None:
         super().__init__(entity_mgr)
+        self.LAMBDA_TIME = self.LAMBDA_TIME * self.TIME_PENALTY_WEIGHT_MULT
         self._auction_bid_count = 0
         self._auction_award_count = 0
         self._anchor_preview_routes: dict[str, object] = {}
@@ -180,10 +191,105 @@ class MarketBasedSolver(GreedyMMCE):
         self._current_round_bdynamic_launches: list[tuple[str, str, float]] = []
         # 订单视图仅用于市场约束（不可撤销、清空校验等），由 DispatchDecisionEngine 注入，避免挂在 EntityManager 上。
         self._order_mgr: Any = None
+        self._market_loadout_applied: bool = False
 
     def bind_order_manager(self, order_mgr: Any) -> None:
         """由编排层在构造/切换求解器后调用，供增量过滤与车队安全校验读取订单池。"""
         self._order_mgr = order_mgr
+
+    @staticmethod
+    def _extract_market_drone_id_suffix(drone_id: str) -> int | None:
+        m = re.search(r"(\d+)$", str(drone_id))
+        if m is None:
+            return None
+        return int(m.group(1))
+
+    def _resolve_market_fixed_drone_pools(self) -> tuple[str, str, set[str], set[str]] | None:
+        """单仓单车且存在 12 架 UAV-TEST-xx 时，解析 9+3 无人机池，否则不生效。"""
+        if len(self.entity_mgr.trucks) != 1 or not self.entity_mgr.depots:
+            return None
+        truck_id = next(iter(self.entity_mgr.trucks.keys()))
+        depot_id = next(iter(self.entity_mgr.depots.keys()))
+        truck_pool: set[str] = set()
+        depot_pool: set[str] = set()
+        for drone_id in self.entity_mgr.drones:
+            idx = self._extract_market_drone_id_suffix(drone_id)
+            if idx is None:
+                continue
+            if idx in self.MARKET_TRUCK_DRONE_INDEXES:
+                truck_pool.add(drone_id)
+            elif idx in self.MARKET_DEPOT_DRONE_INDEXES:
+                depot_pool.add(drone_id)
+        if len(truck_pool) < len(self.MARKET_TRUCK_DRONE_INDEXES):
+            return None
+        if len(depot_pool) < len(self.MARKET_DEPOT_DRONE_INDEXES):
+            return None
+        return truck_id, depot_id, truck_pool, depot_pool
+
+    def _sync_depot_registrations_after_market_loadout(
+        self,
+        depot: Any,
+        truck_pool: set[str],
+        depot_pool: set[str],
+    ) -> None:
+        """与 entities 默认「多数机在仓」的登记一致：上车无人机从仓资产表中移除，留仓机保留/登记。"""
+        for did in list(depot.drone_fleet):
+            if did in truck_pool:
+                if did in depot.idle_drones:
+                    depot.idle_drones.remove(did)
+                depot.drone_fleet.remove(did)
+        for did in depot_pool:
+            depot.register_drone(did, is_idle=True)
+
+    def _apply_market_initial_drone_loadout(self, current_time: float) -> None:
+        """在首次全量/增量市场调度前，将 9+3 归属与 `docked_drones` / `parking_slots` 写回实体，不修改 entities 文件。"""
+        if self._market_loadout_applied:
+            return
+        resolved = self._resolve_market_fixed_drone_pools()
+        if resolved is None:
+            self._market_loadout_applied = True
+            logger.debug(
+                "[MarketBasedSolver] 9/3 固装载不生效：非单车/单仓或缺少编号 UAV-TEST-01..12"
+            )
+            return
+        truck_id, depot_id, truck_pool, depot_pool = resolved
+        truck = self.entity_mgr.trucks.get(truck_id)
+        depot = self.entity_mgr.depots.get(depot_id)
+        if truck is None or depot is None:
+            self._market_loadout_applied = True
+            return
+        if int(getattr(truck, "parking_slots", 0)) < len(truck_pool):
+            truck.parking_slots = len(truck_pool)
+        truck.docked_drones = sorted(truck_pool)
+        for other_id, other_truck in self.entity_mgr.trucks.items():
+            if other_id == truck_id:
+                continue
+            other_truck.docked_drones = [
+                d for d in other_truck.docked_drones if d not in truck_pool
+            ]
+        for drone_id, drone in self.entity_mgr.drones.items():
+            if drone_id in truck_pool:
+                drone.home_type = SourceType.TRUCK
+                drone.home_id = truck_id
+                drone.transport_truck_id = truck_id
+                if not drone.status.is_flying:
+                    drone.current_loc = truck.get_location(current_time)
+            elif drone_id in depot_pool:
+                drone.home_type = SourceType.DEPOT
+                drone.home_id = depot_id
+                drone.transport_truck_id = None
+                if not drone.status.is_flying:
+                    drone.current_loc = depot.location
+        self._sync_depot_registrations_after_market_loadout(depot, truck_pool, depot_pool)
+        self._market_loadout_applied = True
+        logger.info(
+            "[MarketBasedSolver] 已应用市场 9/3 固装载: truck=%s (%d) depot=%s (%d) parking_slots=%d",
+            truck_id,
+            len(truck_pool),
+            depot_id,
+            len(depot_pool),
+            getattr(truck, "parking_slots", 0),
+        )
 
     def _is_order_immutable(self, order_id: str, current_time: float = 0.0) -> bool:
         """判断订单是否已进入不可撤销状态（履约临界点）。
@@ -337,12 +443,14 @@ class MarketBasedSolver(GreedyMMCE):
         scene_id: str | None = None,
     ) -> DispatchPlan:
         """执行一轮市场拍卖调度（全量批次），并在 summary 中附加拍卖统计信息。"""
+        self._apply_market_initial_drone_loadout(current_time)
         self._auction_bid_count = 0
         self._auction_award_count = 0
         self._current_round_bdynamic_launches.clear()
         self._anchor_preview_routes = {}
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
+        pending_orders = self._orders_dict_in_market_auction_order(pending_orders, current_time)
         self._prepare_anchor_preview_routes(pending_orders, current_time, bbox, scene_id)
 
         plan = super().dispatch(pending_orders, current_time, bbox, scene_id=scene_id)
@@ -385,9 +493,10 @@ class MarketBasedSolver(GreedyMMCE):
           2. 不可变更过滤：将已处于 PICKED_UP/DELIVERING 的订单排除出拍卖池
           3. 构建保证时刻表：基于已锁定契约生成基础时刻表
           4. 增量拍卖：仅对 new_orders 收集投标并授标
-          5. 双向锁定：中标后生成新契约，更新无人机/卡车锁定状态
-          6. 返回增量计划（可与前序计划合并）
+        5. 双向锁定：中标后生成新契约，更新无人机/卡车锁定状态
+        6. 返回增量计划（可与前序计划合并）
         """
+        self._apply_market_initial_drone_loadout(current_time)
         self._auction_bid_count = 0
         self._auction_award_count = 0
         self._current_round_bdynamic_launches.clear()
@@ -406,6 +515,7 @@ class MarketBasedSolver(GreedyMMCE):
                 skipped,
             )
 
+        filtered_orders = self._orders_dict_in_market_auction_order(filtered_orders, current_time)
         if not self._anchor_preview_routes:
             self._prepare_anchor_preview_routes(filtered_orders, current_time, bbox, scene_id)
 
@@ -1372,6 +1482,29 @@ class MarketBasedSolver(GreedyMMCE):
         max_payload = max(d.payload_capacity for d in self.entity_mgr.drones.values())
         return order.payload_weight > max_payload
 
+    def _orders_dict_in_market_auction_order(
+        self,
+        orders: dict[str, "Order"],
+        current_time: float,
+    ) -> dict[str, "Order"]:
+        """在调用基类 dispatch 前重排 dict 插入序：超重（仅模式 A 卡车）单优先，再按紧迫度。
+
+        不修改 greedy_mmce：仅 market 入口对本轮订单重排，避免 B_WAIT 先锁约导致
+        卡车专送单 _validate_truck_insertion 恒失败。
+        """
+        if not orders:
+            return orders
+        sorted_list = sorted(
+            orders.values(),
+            key=lambda o: (
+                0 if self._must_assign_to_truck(o) else 1,
+                o.deadline - current_time,
+                o.deadline,
+                o.order_id,
+            ),
+        )
+        return {o.order_id: o for o in sorted_list}
+
     # ── 竞标准入：无人机状态分级 ─────────────────────────────────────
 
     def _classify_drone_eligibility(
@@ -1861,6 +1994,12 @@ class MarketBasedSolver(GreedyMMCE):
             diagnostics["depot_feasible"] += 1
         return self._score_standard_bid(bid, order, current_time)
 
+    def _is_drone_physically_on_truck(self, drone: "Drone", truck: "Truck") -> bool:
+        """与 decision_engine_market 相同语义：docked 或 transport_truck_id 视为在目标卡车上。"""
+        if drone.drone_id in getattr(truck, "docked_drones", []):
+            return True
+        return getattr(drone, "transport_truck_id", None) == truck.truck_id
+
     def _collect_anchor_bids_for_drone(
         self,
         drone: "Drone",
@@ -1879,6 +2018,10 @@ class MarketBasedSolver(GreedyMMCE):
         bids: list[AllocationResult] = []
 
         for truck in self.entity_mgr.trucks.values():
+            # 与 MarketDispatchDecisionEngine 一致：B_WAIT 只能使用当前已在目标卡车
+            # 上真实停靠的无人机，否则计划会在执行层被标为不可行。
+            if not self._is_drone_physically_on_truck(drone, truck):
+                continue
             # B_WAIT / B 模式下卡车不需要绕路到客户，不应使用 _validate_truck_insertion
             # （该校验假设卡车去客户地址，会导致误拒合法的 UAV 协同投标）。
             # 锚点时间可行性已由 _build_anchor_bid 内的 sync 校验覆盖。
@@ -1923,6 +2066,8 @@ class MarketBasedSolver(GreedyMMCE):
         bids: list[AllocationResult] = []
 
         for truck in self.entity_mgr.trucks.values():
+            if not self._is_drone_physically_on_truck(drone, truck):
+                continue
             anchors = self._build_anchor_timetable(truck, current_time)
             if not anchors:
                 continue
@@ -2182,6 +2327,8 @@ class MarketBasedSolver(GreedyMMCE):
         bids: list[AllocationResult] = []
 
         for truck in self.entity_mgr.trucks.values():
+            if not self._is_drone_physically_on_truck(drone, truck):
+                continue
             truck_loc = truck.get_location(current_time)
             anchors = self._build_anchor_timetable(truck, current_time)
             if not anchors:
@@ -2556,16 +2703,14 @@ class MarketBasedSolver(GreedyMMCE):
         truck_last_pos: dict[str, "Position3D"] = None,
     ) -> AllocationResult | None:
         """
-        统一复用贪心基线中的目标函数打分，叠加多维方向性感知评分。
+        统一复用贪心基线中的目标函数打分（距离 + 能耗 + 时间窗迟罚）。
 
         对市场算法中的 B / B_WAIT，卡车主干路线属于既定基础设施成本，
         因此仅将"额外引入的边际卡车成本"计入协同任务评分，而不再把
         "卡车当前位置 -> 起飞锚点"的整段主干路径全量重复计费。
 
-        Mode A 投标叠加：
-          - 回头路惩罚：偏离卡车前进方向的订单得分被提升
-          - 最优插入绕路能耗放大：频繁变向带来的额外机械损耗
-          - 路径邻近度奖励：顺路订单的减分激励
+        注：本阶段不叠加 cost_wait / cost_risk、回头路 / 绕路放大 / 路径邻近奖，
+        仅保留加权距离、能耗与 deadline 迟罚（与 B_DYNAMIC 及 Mode A 基线一致）。
         """
         if alloc.mode in ("B", "B_WAIT"):
             score_total, cost_dist, cost_energy, cost_penalty = self._score_market_b_bid(
@@ -2579,27 +2724,6 @@ class MarketBasedSolver(GreedyMMCE):
             score_total, cost_dist, cost_energy, cost_penalty = self._score_allocation(
                 alloc, order, current_time, truck_last_pos or {}
             )
-
-            if alloc.mode == "A" and math.isfinite(score_total):
-                truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
-                if truck is not None:
-                    cost_backtrack = self._compute_backtrack_penalty(truck, order, current_time)
-
-                    _, _, detour_time = self._find_best_insertion_for_truck(
-                        truck, order, current_time
-                    )
-                    if math.isfinite(detour_time) and truck.speed > 0:
-                        detour_dist = detour_time * truck.speed
-                        cost_detour_energy = (
-                            self.C_ENERGY_ET
-                            * self._truck_energy_wh(detour_dist)
-                            * (self.DETOUR_ENERGY_MULTIPLIER - 1.0)
-                        )
-                    else:
-                        cost_detour_energy = 0.0
-
-                    path_bonus = self._compute_path_proximity_bonus(truck, order, current_time)
-                    score_total += cost_backtrack + cost_detour_energy - path_bonus
 
         if not math.isfinite(score_total):
             return None
@@ -2616,15 +2740,14 @@ class MarketBasedSolver(GreedyMMCE):
         current_time: float,
     ) -> tuple[float, float, float, float]:
         """
-        市场拍卖中的协同模式评分。
+        市场拍卖中的协同模式（B / B_WAIT）评分。
 
-        基础成本（不变）：
-          - UAV 飞行距离与飞行能耗仍按基线口径全量计入
-          - 卡车部分只计"边际增量成本"，若锚点本就在卡车主干路线上，则增量视为 0
+        当前与 B_DYNAMIC 一致：仅 **加权距离 + 能耗 + 时间窗迟罚**；
+        暂不纳入 cost_wait / cost_risk、回头路 / 绕路放大 / 路径邻近奖（见 `_score_standard_bid` 说明）。
 
-        动态扩展（新增）：
-          - cost_wait: 非对称等待惩罚（机等车低权重 / 车等机高权重）
-          - cost_risk: 接近生死线的锚点被选中时附加风险惩罚
+        基础成本：
+          - UAV 飞行距离与飞行能耗按基线全量计入
+          - 卡车只计"边际增量成本"，若锚点本就在卡车主干路线上，则增量视为 0
         """
         drone = self.entity_mgr.drones.get(alloc.drone_id)
         if drone is None or drone.cruise_speed <= 0:
@@ -2672,57 +2795,7 @@ class MarketBasedSolver(GreedyMMCE):
         lateness = max(0.0, delivery_time_est - order.deadline)
         cost_penalty = self.LAMBDA_TIME * order.penalty_rate * lateness
 
-        # ── 非对称等待惩罚 ────────────────────────────────────────
-        cost_wait = 0.0
-        uav_arrival_at_recovery = delivery_time_est + dist_back / drone.cruise_speed
-        recovery_anchor = None
-        if truck is not None:
-            for anchor in self._build_anchor_timetable(truck, current_time):
-                if anchor["anchor_id"] == alloc.recovery_station_id:
-                    recovery_anchor = anchor
-                    break
-
-        if recovery_anchor is not None:
-            truck_arrival_at_recovery = recovery_anchor["arrival_time"]
-            wait_diff = truck_arrival_at_recovery - uav_arrival_at_recovery
-            if wait_diff > 0:
-                # 机等车：基础等待 + 机会成本（无法竞标新订单的损失）
-                cost_wait = (self.OMEGA_UAV_IDLE + self.OPPORTUNITY_COST_PER_SEC) * wait_diff
-            else:
-                cost_wait = self.OMEGA_TRUCK_IDLE * abs(wait_diff)
-
-        # ── 接近生死线的风险惩罚 ──────────────────────────────────
-        cost_risk = 0.0
-        if recovery_anchor is not None:
-            latest_rendezvous = recovery_anchor["latest_rendezvous_time"]
-            margin = latest_rendezvous - uav_arrival_at_recovery
-            if margin > 0 and self.T_MAX_WAIT > 0:
-                risk_ratio = 1.0 - min(margin / self.T_MAX_WAIT, 1.0)
-                cost_risk = self.DEADLINE_RISK_WEIGHT * risk_ratio * (cost_dist + cost_energy)
-
-        # ── 回头路惩罚（方向性约束）──────────────────────────────
-        cost_backtrack = 0.0
-        if truck is not None:
-            cost_backtrack = self._compute_backtrack_penalty(truck, order, current_time)
-
-        # ── 绕路能耗放大（频繁变向的额外机械损耗）──────────────────
-        cost_detour_energy = 0.0
-        if truck is not None and truck_distance > 0:
-            cost_detour_energy = (
-                self.C_ENERGY_ET
-                * self._truck_energy_wh(truck_distance)
-                * (self.DETOUR_ENERGY_MULTIPLIER - 1.0)
-            )
-
-        # ── 路径邻近度奖励（顺路减分）──────────────────────────────
-        path_bonus = 0.0
-        if truck is not None:
-            path_bonus = self._compute_path_proximity_bonus(truck, order, current_time)
-
-        score_total = (
-            cost_dist + cost_energy + cost_penalty + cost_wait + cost_risk
-            + cost_backtrack + cost_detour_energy - path_bonus
-        )
+        score_total = cost_dist + cost_energy + cost_penalty
         return score_total, cost_dist, cost_energy, cost_penalty
 
     def _score_b_dynamic_bid(
@@ -2731,12 +2804,11 @@ class MarketBasedSolver(GreedyMMCE):
         order: "Order",
         current_time: float,
     ) -> tuple[float, float, float, float]:
-        """B_DYNAMIC 评分：站点起飞 + 仓库回收，不含等待惩罚和风险溢价。
+        """B_DYNAMIC 评分：站点起飞 + 仓库回收，仅距离 + 能耗 + 时间窗迟罚。
 
         无人机从锚点起飞送达后直飞仓库，无需与卡车同步：
           - 卡车只计 launch 段边际距离（锚点在路线上则为 0）
           - UAV 计全量距离/能耗（launch→customer→depot）
-          - 无 cost_wait（不等卡车）、无 cost_risk（不依赖锚点生死线）
         """
         drone = self.entity_mgr.drones.get(alloc.drone_id)
         if drone is None or drone.cruise_speed <= 0:
