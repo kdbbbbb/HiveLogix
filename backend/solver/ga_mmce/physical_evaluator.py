@@ -424,6 +424,7 @@ class PhysicalEvaluator:
                 "arrival_time": arrival,
                 "departure_time": completion,
                 "order_id": order_id,
+                "action": "deliver",
             }],
             truck_final_node_id=order_id,
             truck_final_time=completion,
@@ -529,6 +530,7 @@ class PhysicalEvaluator:
                     "arrival_time": launch_arrival_time,
                     "departure_time": truck_depart_launch_time,
                     "order_id": order_id,
+                    "action": "launch",
                 },
                 {
                     "node_id": recover_node_id,
@@ -537,6 +539,7 @@ class PhysicalEvaluator:
                     "arrival_time": truck_recover_arrival,
                     "departure_time": truck_final_time,
                     "order_id": order_id,
+                    "action": "recover",
                 },
             ],
             drone_route_fragment={

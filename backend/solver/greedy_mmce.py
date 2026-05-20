@@ -1007,16 +1007,18 @@ class GreedyMMCE:
             service_time = max(0.0, prev_departure - prev_arrival)
             departure = arrival + service_time
 
-            route.nodes.append(
-                TruckRouteNode(
-                    node_id=node_id,
-                    node_type=node_type,
-                    position=stop_pos,
-                    arrival_time=arrival,
-                    departure_time=departure,
-                    order_id=stop.get("order_id", ""),
-                )
+            route_node = TruckRouteNode(
+                node_id=node_id,
+                node_type=node_type,
+                position=stop_pos,
+                arrival_time=arrival,
+                departure_time=departure,
+                order_id=stop.get("order_id", ""),
             )
+            action = str(stop.get("action", "") or "")
+            if action:
+                setattr(route_node, "action", action)
+            route.nodes.append(route_node)
 
             if node_type == "station":
                 route.charging_stop_ids.append(node_id)

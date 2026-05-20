@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 from .adapters import (
     apply_initial_drone_layout_overlay,
@@ -32,7 +32,7 @@ from .population import enforce_fixed_tail, initialize_population
 logger = logging.getLogger(__name__)
 DEBUG_LOG_PATH = Path(__file__).resolve().parents[1] / "ga_mmce_debug_log"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-STATIC_PLAN_CACHE_SCHEMA = 1
+STATIC_PLAN_CACHE_SCHEMA = 2
 STATIC_PLAN_CACHE_ENV = "GA_MMCE_REUSE_STATIC_PLAN"
 STATIC_PLAN_CACHE_PATH_ENV = "GA_MMCE_STATIC_PLAN_CACHE_PATH"
 
@@ -57,6 +57,8 @@ class GAMMCESolver:
         self.decoder = GADecoder(self.config, self.evaluator)
         self.last_best_individual: Individual | None = None
         self.last_best_decode_result: Any | None = None
+        self.last_population: list[Individual] = []
+        self.dynamic_archive: list[Individual] = []
         self._debug_eval_errors: dict[str, int] = {}
         self._evolution_rows: list[dict[str, Any]] = []
         self._mutation_stats: dict[str, Any] = self._empty_mutation_stats()
@@ -67,6 +69,7 @@ class GAMMCESolver:
         self._time_budget_hit: bool = False
         self._actual_generations: int = 0
         self._active_diagnostics_label: str = "static"
+        self._force_b_repair_seed_count: int = 0
         self._reuse_static_plan_cache_override: bool | None = None
 
         if self.config.random_seed is not None:
@@ -128,7 +131,17 @@ class GAMMCESolver:
             scene_id=scene_id,
         )
         setattr(state, "_ga_solver", self)
-        return self.reschedule_on_event(state, {}, current_time)
+        dynamic_new_ids = {
+            str(order_id)
+            for order_id in (getattr(self, "_ga_dynamic_new_order_ids", set()) or set())
+            if str(order_id)
+        }
+        dynamic_new_orders = {
+            order_id: order
+            for order_id, order in replan_orders.items()
+            if str(order_id) in dynamic_new_ids
+        }
+        return self.reschedule_on_event(state, dynamic_new_orders, current_time)
 
     def reschedule_on_event(
         self,
@@ -187,6 +200,7 @@ class GAMMCESolver:
         self._last_generation_seconds = 0.0
         self._actual_generations = 0
         self._time_budget_hit = False
+        self._force_b_repair_seed_count = 0
         self._active_time_budget_seconds = (
             float(time_budget_seconds)
             if time_budget_seconds is not None
@@ -243,6 +257,14 @@ class GAMMCESolver:
             state,
             context,
         )
+        repair_warm_starts = self._build_dynamic_b_repair_warm_starts(
+            warm_start_seeds,
+            b_seed_rendezvous_by_order,
+            state,
+            context,
+        )
+        if repair_warm_starts:
+            warm_start_seeds = repair_warm_starts + warm_start_seeds
         population = initialize_population(
             order_ids=context.order_ids,
             gene_pool=context.gene_pool,
@@ -262,6 +284,18 @@ class GAMMCESolver:
             mutation_mode_probabilities=self._mutation_mode_probabilities(),
             fixed_tail_order_ids=context.fixed_tail_order_ids,
             fixed_tail_gene_by_order=context.fixed_tail_gene_by_order,
+            prefer_bc_warm_start=(
+                self._active_diagnostics_label == "dynamic"
+                and bool(getattr(self.config, "dynamic_preserve_previous_best", True))
+            ),
+            dynamic_fill_from_warm_start=(
+                self._active_diagnostics_label == "dynamic"
+                and bool(getattr(self.config, "dynamic_preserve_previous_best", True))
+            ),
+            dynamic_mutable_order_ids=[
+                str(order_id)
+                for order_id in getattr(state, "_ga_reoptimized_order_ids", []) or []
+            ],
         )
         if not population:
             plan = self._empty_plan(dispatch_type=dispatch_type, reason="population_init_failed")
@@ -271,6 +305,7 @@ class GAMMCESolver:
             return plan
 
         self._evaluate_population(population, state, context)
+        self._remember_dynamic_population(population, context, source="initial")
         self._debug_population_snapshot("initial", population)
 
         best_seen = math.inf
@@ -375,6 +410,7 @@ class GAMMCESolver:
                 population.sort(key=lambda ind: ind.fitness)
                 new_population.extend(copy.deepcopy(population[: self.config.population_size - len(new_population)]))
             population = new_population
+            self._remember_dynamic_population(population, context, source=f"gen:{generation}")
             self._last_generation_seconds = time.time() - generation_started
             final_population_needs_record = True
             final_generation_index = generation + 1
@@ -385,6 +421,7 @@ class GAMMCESolver:
             population.sort(key=lambda ind: ind.fitness)
             self._record_generation(final_generation_index, population, started)
 
+        self._remember_dynamic_population(population, context, source="final")
         population.sort(key=lambda ind: ind.fitness)
         best = population[0]
         self.last_best_individual = copy.deepcopy(best)
@@ -399,6 +436,103 @@ class GAMMCESolver:
         self._debug_run_end(plan, best, context, started)
         self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
         return plan
+
+    def _remember_dynamic_population(self, population: list[Individual], context: Any, source: str) -> None:
+        eligible = self._eligible_archive_individuals(population, context)
+        if not eligible:
+            return
+
+        update_top_k = max(1, int(getattr(self.config, "dynamic_archive_update_top_k", 12) or 12))
+        archive_size = max(0, int(getattr(self.config, "dynamic_archive_size", 60) or 0))
+
+        top_by_fitness = sorted(eligible, key=lambda ind: float(getattr(ind, "fitness", math.inf)))[:update_top_k]
+        self.last_population = [self._copy_individual_for_archive(ind) for ind in top_by_fitness]
+
+        if archive_size <= 0:
+            self.dynamic_archive = []
+            return
+
+        merged = list(eligible) + list(self.dynamic_archive or [])
+        selected = self._select_archive_individuals(merged, update_top_k=update_top_k, max_size=archive_size)
+        self.dynamic_archive = [self._copy_individual_for_archive(ind) for ind in selected]
+        self._debug_write(
+            "dynamic_archive_update "
+            f"source={source} "
+            f"eligible={len(eligible)} "
+            f"last_population={len(self.last_population)} "
+            f"archive={len(self.dynamic_archive)}"
+        )
+
+    def _eligible_archive_individuals(self, population: list[Individual], context: Any) -> list[Individual]:
+        required_orders = set(str(oid) for oid in getattr(context, "order_ids", []) or [])
+        if not required_orders:
+            return []
+        allowed_genes = set(str(gene) for gene in getattr(context, "gene_pool", []) or [])
+        result: list[Individual] = []
+        for individual in population or []:
+            fitness = float(getattr(individual, "fitness", math.inf))
+            if not math.isfinite(fitness):
+                continue
+            if set(str(oid) for oid in getattr(individual, "sequence", []) or []) != required_orders:
+                continue
+            if len(getattr(individual, "sequence", []) or []) != len(getattr(individual, "assignment", []) or []):
+                continue
+            if len(getattr(individual, "sequence", []) or []) != len(getattr(individual, "rendezvous", []) or []):
+                continue
+            if allowed_genes and any(str(gene) not in allowed_genes for gene in individual.assignment):
+                continue
+            result.append(individual)
+        return result
+
+    def _select_archive_individuals(
+        self,
+        individuals: list[Individual],
+        update_top_k: int,
+        max_size: int,
+    ) -> list[Individual]:
+        if not individuals or max_size <= 0:
+            return []
+
+        selected: list[Individual] = []
+        seen: set[tuple[tuple[str, ...], tuple[str, ...], str]] = set()
+
+        def add(items: Iterable[Individual]) -> None:
+            for item in items:
+                if len(selected) >= max_size:
+                    return
+                key = self._archive_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected.append(item)
+
+        ranked = sorted(individuals, key=lambda ind: float(getattr(ind, "fitness", math.inf)))
+        add(ranked[:update_top_k])
+        add(sorted(ranked, key=lambda ind: (-self._archive_mode_count(ind, "B"), float(getattr(ind, "fitness", math.inf))))[:update_top_k])
+        add(sorted(ranked, key=lambda ind: (-self._archive_mode_count(ind, "C"), float(getattr(ind, "fitness", math.inf))))[:update_top_k])
+        add(sorted(ranked, key=lambda ind: (-self._archive_bc_count(ind), float(getattr(ind, "fitness", math.inf))))[:update_top_k])
+        add(list(individuals)[-update_top_k:])
+        add(ranked)
+        return selected[:max_size]
+
+    def _archive_key(self, individual: Individual) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+        return (
+            tuple(str(oid) for oid in individual.sequence),
+            tuple(str(gene) for gene in individual.assignment),
+            repr(individual.rendezvous),
+        )
+
+    def _archive_mode_count(self, individual: Individual, mode: str) -> int:
+        return sum(1 for gene in individual.assignment if self._gene_mode(str(gene)) == mode)
+
+    def _archive_bc_count(self, individual: Individual) -> int:
+        return self._archive_mode_count(individual, "B") + self._archive_mode_count(individual, "C")
+
+    def _copy_individual_for_archive(self, individual: Individual) -> Individual:
+        copied = copy.deepcopy(individual)
+        copied.decoded_plan = None
+        setattr(copied, "decoded_result", None)
+        return copied
 
     def _evaluate_population(self, population: list[Individual], state: Any, context: Any) -> None:
         for individual in population:
@@ -442,7 +576,21 @@ class GAMMCESolver:
         evaluation_state = clone_state_for_decode(state)
         apply_initial_drone_layout_overlay(evaluation_state, context, self.config)
 
-        for order_id in context.order_ids:
+        order_ids = list(context.order_ids)
+        if (
+            self._active_diagnostics_label == "dynamic"
+            and bool(getattr(self.config, "dynamic_preserve_previous_best", True))
+        ):
+            reoptimized_ids = [
+                str(order_id)
+                for order_id in getattr(state, "_ga_reoptimized_order_ids", []) or []
+                if str(order_id) in set(context.order_ids)
+            ]
+            if reoptimized_ids:
+                order_ids = reoptimized_ids
+                self._debug_write(f"b_candidate_precheck_dynamic_scope order_ids={order_ids}")
+
+        for order_id in order_ids:
             a_candidate = self._evaluate_initial_mode_a(evaluation_state, context, order_id)
             b_candidate = self._best_initial_mode_b(evaluation_state, context, order_id)
             c_candidate = self._best_initial_mode_c(evaluation_state, context, order_id)
@@ -660,6 +808,115 @@ class GAMMCESolver:
                 continue
         ranked.sort(key=lambda ind: float(getattr(ind, "fitness", float("inf"))))
         return ranked
+
+    def _build_dynamic_b_repair_warm_starts(
+        self,
+        warm_start_seeds: list[Individual],
+        b_seed_rendezvous_by_order: dict[str, tuple[str, dict[str, str]]],
+        state: Any,
+        context: Any,
+    ) -> list[Individual]:
+        self._force_b_repair_seed_count = 0
+        if self._active_diagnostics_label != "dynamic":
+            return []
+        if not bool(getattr(self.config, "dynamic_preserve_previous_best", True)):
+            return []
+        if not b_seed_rendezvous_by_order:
+            return []
+        if self._warm_starts_have_bc(warm_start_seeds):
+            return []
+
+        mutable_ids = {
+            str(order_id)
+            for order_id in getattr(state, "_ga_reoptimized_order_ids", []) or []
+            if str(order_id) in set(context.order_ids)
+        }
+        if not mutable_ids:
+            return []
+
+        valid_b_seeds = {
+            str(order_id): (str(gene), copy.deepcopy(rv))
+            for order_id, (gene, rv) in b_seed_rendezvous_by_order.items()
+            if str(order_id) in mutable_ids and str(gene) in set(context.gene_pool)
+        }
+        if not valid_b_seeds:
+            return []
+
+        base = copy.deepcopy(warm_start_seeds[0]) if warm_start_seeds else Individual(
+            sequence=list(context.order_ids),
+            assignment=["A"] * len(context.order_ids),
+            rendezvous=[None] * len(context.order_ids),
+        )
+        repairs: list[Individual] = []
+        order_index = {str(order_id): idx for idx, order_id in enumerate(base.sequence)}
+
+        combined = copy.deepcopy(base)
+        changed = False
+        for order_id, (gene, rv) in valid_b_seeds.items():
+            idx = order_index.get(order_id)
+            if idx is None:
+                continue
+            combined.assignment[idx] = gene
+            combined.rendezvous[idx] = copy.deepcopy(rv)
+            changed = True
+        if changed:
+            repairs.append(combined)
+
+        for order_id, (gene, rv) in valid_b_seeds.items():
+            single = copy.deepcopy(base)
+            idx = order_index.get(order_id)
+            if idx is None:
+                continue
+            single.assignment[idx] = gene
+            single.rendezvous[idx] = copy.deepcopy(rv)
+            repairs.append(single)
+
+        prepared: list[Individual] = []
+        seen: set[tuple[tuple[str, ...], tuple[str, ...], str]] = set()
+        for seed in repairs:
+            try:
+                enforce_fixed_tail(
+                    seed,
+                    context.fixed_tail_order_ids,
+                    context.fixed_tail_gene_by_order,
+                )
+                if set(seed.sequence) != set(context.order_ids):
+                    continue
+                if any(gene not in set(context.gene_pool) for gene in seed.assignment):
+                    continue
+                seed.validate_with_context(
+                    truck_drone_ids=context.truck_drone_ids,
+                    depot_drone_ids=context.depot_drone_ids,
+                    valid_drone_ids=context.all_drone_ids,
+                    support_node_ids=context.support_node_ids,
+                )
+                self._evaluate_individual(seed, state, context)
+                key = (
+                    tuple(str(order_id) for order_id in seed.sequence),
+                    tuple(str(gene) for gene in seed.assignment),
+                    repr(seed.rendezvous),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                prepared.append(seed)
+            except Exception:
+                continue
+
+        self._force_b_repair_seed_count = len(prepared)
+        if prepared:
+            self._debug_write(
+                "dynamic_b_repair_seeds "
+                f"count={len(prepared)} "
+                f"orders={sorted(valid_b_seeds)}"
+            )
+        return prepared
+
+    def _warm_starts_have_bc(self, seeds: list[Individual]) -> bool:
+        for seed in seeds or []:
+            if any(self._gene_mode(str(gene)) in {"B", "C"} for gene in seed.assignment):
+                return True
+        return False
 
     def _timeout(self, started: float) -> bool:
         budget = self._active_time_budget_seconds
@@ -1482,6 +1739,7 @@ class GAMMCESolver:
         plan.summary["elapsed_seconds"] = elapsed
         plan.summary["early_stop_triggered"] = bool(self._early_stop_info.get("early_stop_triggered", False))
         plan.summary["time_budget_hit"] = bool(self._time_budget_hit)
+        plan.summary["force_b_repair_seed_count"] = int(self._force_b_repair_seed_count)
         plan.summary.setdefault("fallback_used", False)
 
         try:

@@ -214,6 +214,9 @@ def initialize_population(
     mutation_mode_probabilities: dict[str, float] | None = None,
     fixed_tail_order_ids: list[str] | None = None,
     fixed_tail_gene_by_order: dict[str, tuple[str, dict[str, str] | None]] | None = None,
+    prefer_bc_warm_start: bool = False,
+    dynamic_fill_from_warm_start: bool = False,
+    dynamic_mutable_order_ids: list[str] | None = None,
 ) -> list[Individual]:
     _check_inputs(order_ids, gene_pool, support_node_ids)
     if pop_size <= 0:
@@ -224,10 +227,19 @@ def initialize_population(
     population: list[Individual] = []
 
     if warm_start:
-        ranked_warm_starts = sorted(
-            list(warm_start),
-            key=lambda ind: float(getattr(ind, "fitness", float("inf"))),
-        )
+        if prefer_bc_warm_start:
+            ranked_warm_starts = sorted(
+                list(warm_start),
+                key=lambda ind: (
+                    -_bc_count(ind),
+                    float(getattr(ind, "fitness", float("inf"))),
+                ),
+            )
+        else:
+            ranked_warm_starts = sorted(
+                list(warm_start),
+                key=lambda ind: float(getattr(ind, "fitness", float("inf"))),
+            )
         for seed in ranked_warm_starts:
             copied = _copy_seed_if_valid(
                 seed,
@@ -333,7 +345,29 @@ def initialize_population(
             )
             index += 1
 
+    warm_clone_bases = [copy.deepcopy(ind) for ind in population]
+    mutable_order_ids = {str(order_id) for order_id in (dynamic_mutable_order_ids or [])}
+    clone_index = 0
     while len(population) < pop_size:
+        if dynamic_fill_from_warm_start and warm_clone_bases and mutable_order_ids:
+            base = copy.deepcopy(warm_clone_bases[clone_index % len(warm_clone_bases)])
+            clone_index += 1
+            _mutate_mutable_orders_only(
+                base,
+                mutable_order_ids=mutable_order_ids,
+                gene_pool=gene_pool,
+                support_node_ids=support_node_ids,
+                allow_c_recover_station=allow_c_recover_station,
+                mode_probabilities=mutation_mode_probabilities,
+            )
+            population.append(
+                enforce_fixed_tail(
+                    base,
+                    fixed_tail_order_ids,
+                    fixed_tail_gene_by_order,
+                )
+            )
+            continue
         population.append(
             enforce_fixed_tail(
                 make_random_individual(
@@ -349,3 +383,40 @@ def initialize_population(
         )
 
     return population[:pop_size]
+
+
+def _bc_count(ind: Individual) -> int:
+    return sum(1 for gene in ind.assignment if str(gene).startswith("B_") or str(gene).startswith("C_"))
+
+
+def _mutate_mutable_orders_only(
+    ind: Individual,
+    mutable_order_ids: set[str],
+    gene_pool: list[str],
+    support_node_ids: list[str],
+    allow_c_recover_station: bool,
+    mode_probabilities: dict[str, float] | None,
+) -> None:
+    mutable_indices = [
+        idx
+        for idx, order_id in enumerate(ind.sequence)
+        if str(order_id) in mutable_order_ids
+    ]
+    if not mutable_indices:
+        return
+    if len(mutable_indices) >= 2 and random.random() < 0.20:
+        i, j = random.sample(mutable_indices, 2)
+        ind.sequence[i], ind.sequence[j] = ind.sequence[j], ind.sequence[i]
+        ind.assignment[i], ind.assignment[j] = ind.assignment[j], ind.assignment[i]
+        ind.rendezvous[i], ind.rendezvous[j] = ind.rendezvous[j], ind.rendezvous[i]
+
+    for idx in mutable_indices:
+        if random.random() < 0.35:
+            ind.assignment[idx] = choose_gene_by_mode(gene_pool, mode_probabilities)
+        if random.random() < 0.45 or ind.assignment[idx] == "A":
+            ind.rendezvous[idx] = make_random_rendezvous_for_gene(
+                ind.assignment[idx],
+                support_node_ids,
+                allow_c_recover_station,
+            )
+    ind.validate()

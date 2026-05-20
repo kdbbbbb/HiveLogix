@@ -596,6 +596,9 @@ class GADecoder:
                     order_id=str(stop.get("order_id", "")),
                 )
             )
+            action = str(stop.get("action", "") or "")
+            if action:
+                setattr(route.nodes[-1], "action", action)
             if stop.get("node_type") == "station":
                 route.charging_stop_ids.append(str(stop.get("node_id", "")))
             route.geometry.append(stop_pos)
@@ -848,6 +851,9 @@ class GADecoder:
     def _normalize_stop_for_route(self, state: Any, stop: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(stop)
         node_id = str(normalized.get("node_id", ""))
+        explicit_type = str(normalized.get("node_type", "") or "")
+        if explicit_type in {"customer", "recovery", "origin"}:
+            return normalized
         if node_id in self._mapping(state, "stations"):
             normalized["node_type"] = "station"
         elif self._is_depot_node_id(state, node_id):

@@ -29,6 +29,18 @@ class GAConfig:
     reopt_window_size: int | None = None
     reopt_horizon_seconds: float | None = None
 
+    fast_incumbent_enabled: bool = True
+    fast_incumbent_eval_count: int = 8
+    fast_incumbent_budget_seconds: float = 0.3
+    dynamic_preserve_previous_best: bool = True
+    dynamic_allow_new_order_pending: bool = True
+    dynamic_neighbor_reopt_count: int = 0
+    dynamic_archive_size: int = 60
+    dynamic_archive_update_top_k: int = 12
+    dynamic_archive_seed_count: int = 16
+    dynamic_warm_start_limit: int = 24
+    dynamic_skip_ga_when_fast_incumbent_safe: bool = True
+
     mutation_mode_prob_a: float = 0.40
     mutation_mode_prob_b: float = 0.25
     mutation_mode_prob_c: float = 0.35
@@ -116,9 +128,24 @@ DYNAMIC_GA_CONFIG: dict[str, Any] = {
     "time_budget_seconds": 3.0,
     "enable_csv": True,
     "enable_png": False,
+    "use_greedy_seed": False,
+    "use_truck_only_seed": False,
+    "use_obl_seed": False,
+    "use_balanced_initialization": False,
     "use_warm_start": True,
-    "warm_start_mutations": 10,
+    "warm_start_mutations": 0,
     "reopt_window_size": 8,
+    "fast_incumbent_enabled": True,
+    "fast_incumbent_eval_count": 8,
+    "fast_incumbent_budget_seconds": 0.3,
+    "dynamic_preserve_previous_best": True,
+    "dynamic_allow_new_order_pending": True,
+    "dynamic_neighbor_reopt_count": 0,
+    "dynamic_archive_size": 60,
+    "dynamic_archive_update_top_k": 12,
+    "dynamic_archive_seed_count": 16,
+    "dynamic_warm_start_limit": 24,
+    "dynamic_skip_ga_when_fast_incumbent_safe": True,
     "diagnostics_label": "dynamic",
 }
 

@@ -468,6 +468,17 @@ def _prepare_segment_start(
         drone.waiting_recovery_station_id = ""
         if drone.drone_id not in truck.docked_drones:
             truck.docked_drones.append(drone.drone_id)
+        logger.info(
+            "[GA-MMCE runtime] prepare_segment_start drone=%s order=%s truck=%s "
+            "launch_station=%s scheduled_launch_time=%.1f current_time=%.1f truck_launch=%s",
+            drone.drone_id,
+            segment.order_id,
+            truck.truck_id,
+            segment.launch_node_id,
+            float(drone.scheduled_launch_time),
+            current_time,
+            True,
+        )
         return
 
     drone.current_loc = segment.launch_loc
@@ -477,6 +488,17 @@ def _prepare_segment_start(
     drone.launch_station_id = ""
     drone.waiting_recovery_station_id = ""
     _remove_from_all_trucks(entity_mgr, drone.drone_id)
+    logger.info(
+        "[GA-MMCE runtime] prepare_segment_start drone=%s order=%s truck=%s "
+        "launch_station=%s scheduled_launch_time=%.1f current_time=%.1f truck_launch=%s",
+        drone.drone_id,
+        segment.order_id,
+        segment.truck_id or "-",
+        segment.launch_node_id,
+        float(drone.scheduled_launch_time),
+        current_time,
+        False,
+    )
 
 
 def _next_segment_for_drone(drone: Any) -> GARuntimeSegment | None:

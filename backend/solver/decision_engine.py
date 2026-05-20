@@ -314,12 +314,18 @@ class DispatchDecisionEngine:
             )
 
         self._activate_path_planner(scene_id)
-        plan = self.solver.dispatch_replan_current_state(
-            planning_pool,
-            current_time,
-            bbox,
-            scene_id=scene_id,
-        )
+        if self.solver_name == "ga_mmce":
+            setattr(self.solver, "_ga_dynamic_new_order_ids", set(new_orders))
+        try:
+            plan = self.solver.dispatch_replan_current_state(
+                planning_pool,
+                current_time,
+                bbox,
+                scene_id=scene_id,
+            )
+        finally:
+            if self.solver_name == "ga_mmce":
+                setattr(self.solver, "_ga_dynamic_new_order_ids", set())
         plan.summary["solver"] = self.solver_name
         plan.summary["dispatch_type"] = "dynamic_replan"
         plan.summary["replanned_assigned_orders"] = len(replannable_assigned)
@@ -374,6 +380,15 @@ class DispatchDecisionEngine:
         truck suffix.
         """
         summary = plan.summary or {}
+        patch_replace = summary.get("ga_route_patch_replace_order_ids", [])
+        if patch_replace:
+            patch_ids = {str(oid) for oid in patch_replace if str(oid)}
+            locked = {str(oid) for oid in (summary.get("locked_ids", []) or [])}
+            frozen = {str(oid) for oid in (summary.get("frozen_future_order_ids", []) or [])}
+            return {
+                oid for oid in patch_ids
+                if oid and oid not in locked and oid not in frozen
+            }
         locked = {str(oid) for oid in (summary.get("locked_ids", []) or [])}
         frozen = {str(oid) for oid in (summary.get("frozen_future_order_ids", []) or [])}
         reoptimized = {
@@ -527,6 +542,11 @@ class DispatchDecisionEngine:
                     plan.allocations,
                     current_time,
                     replace_future_order_ids=replace_future_order_ids,
+                    route_patch=(
+                        plan.summary.get("ga_route_patch")
+                        if self.solver_name == "ga_mmce" and bool(plan.summary.get("ga_route_patch_enabled", False))
+                        else None
+                    ),
                 )
                 continue
 
@@ -543,6 +563,7 @@ class DispatchDecisionEngine:
                         "arrival_time": node.arrival_time,
                         "departure_time": node.departure_time,
                         "order_id": node.order_id,
+                        "action": str(getattr(node, "action", "") or ""),
                     }
                     for node in route.nodes
                 ]
@@ -607,6 +628,7 @@ class DispatchDecisionEngine:
         allocations: list,
         current_time: float,
         replace_future_order_ids: set[str] | None = None,
+        route_patch: dict | None = None,
     ) -> None:
         """增量模式下合并卡车未执行后缀，保护已经执行/正在执行的路线。
 
@@ -618,6 +640,17 @@ class DispatchDecisionEngine:
         existing_stops: list[dict] = getattr(truck, "_planned_route_stops", None) or []
         cursor = int(getattr(truck, "_planned_route_cursor", 0))
         truck._planned_route_solver = self.solver_name
+        route_patch = route_patch or {}
+        patch_enabled = self.solver_name == "ga_mmce" and bool(route_patch.get("enabled", False))
+        patch_replace_ids = {
+            str(oid)
+            for oid in (route_patch.get("replace_order_ids", []) or [])
+            if str(oid)
+        }
+        patch_anchor_by_order = {
+            str(order_id): dict(anchor or {})
+            for order_id, anchor in (route_patch.get("anchor_by_order", {}) or {}).items()
+        }
 
         if not existing_stops:
             # 卡车尚未有路线（首次被增量调度命中），按全量模式设置
@@ -630,6 +663,7 @@ class DispatchDecisionEngine:
                         "node_id": n.node_id, "node_type": n.node_type,
                         "position": n.position, "arrival_time": n.arrival_time,
                         "departure_time": n.departure_time, "order_id": n.order_id,
+                        "action": str(getattr(n, "action", "") or ""),
                     }
                     for n in new_route.nodes
                 ]
@@ -646,7 +680,7 @@ class DispatchDecisionEngine:
 
         # 仅对未执行区间做去重：已执行过的同站点在新批次中应允许再次停靠。
         future_stops = existing_stops[cursor:]
-        replace_ids = {str(oid) for oid in (replace_future_order_ids or set())}
+        replace_ids = patch_replace_ids or {str(oid) for oid in (replace_future_order_ids or set())}
         if replace_ids:
             before = len(future_stops)
             future_stops = [
@@ -665,6 +699,10 @@ class DispatchDecisionEngine:
         def _stop_key(stop_dict: dict) -> tuple:
             node_type = stop_dict.get("node_type", "")
             node_id = stop_dict.get("node_id", "")
+            if self.solver_name == "ga_mmce":
+                order_id = str(stop_dict.get("order_id", "") or "")
+                action = str(stop_dict.get("action", "") or "")
+                return (node_type, node_id, order_id, action)
             return (node_type, node_id)
 
         existing_future_keys = {_stop_key(s) for s in future_stops}
@@ -673,11 +711,15 @@ class DispatchDecisionEngine:
         new_stops = []
         for node in new_route.nodes:
             if node.node_type in ("customer", "recovery", "station"):
+                order_id = str(node.order_id or "")
+                if patch_enabled and order_id not in replace_ids:
+                    continue
                 key = _stop_key(
                     {
                         "node_type": node.node_type,
                         "node_id": node.node_id,
-                        "order_id": node.order_id,
+                        "order_id": order_id,
+                        "action": str(getattr(node, "action", "") or ""),
                     }
                 )
                 if key in existing_future_keys:
@@ -688,17 +730,31 @@ class DispatchDecisionEngine:
                     "position": node.position,
                     "arrival_time": node.arrival_time,
                     "departure_time": node.departure_time,
-                    "order_id": node.order_id,
+                    "order_id": order_id,
+                    "action": str(getattr(node, "action", "") or ""),
                 })
                 existing_future_keys.add(key)
 
         if not new_stops:
+            if patch_enabled:
+                truck._planned_route_stops = existing_stops
+                self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
+                logger.info(
+                    "[DispatchDecisionEngine] GA route patch 卡车 %s 无新增停靠，保留旧后缀",
+                    truck.truck_id,
+                )
+                return
             # 即便无新增停靠，也需要应用本批次后缀更新（例如 recovery 等待时长更新）。
             # 只更新已有 future_stops 的时间，切勿截断其他未来停靠点。
             refreshed_future = [dict(stop) for stop in future_stops]
             for node in new_route.nodes:
                 if node.node_type in ("customer", "recovery", "station"):
-                    node_key = _stop_key({"node_type": node.node_type, "node_id": node.node_id})
+                    node_key = _stop_key({
+                        "node_type": node.node_type,
+                        "node_id": node.node_id,
+                        "order_id": node.order_id,
+                        "action": str(getattr(node, "action", "") or ""),
+                    })
                     for stop in refreshed_future:
                         if _stop_key(stop) == node_key:
                             # 累加等待时间或取最大值，保持原有业务逻辑（至少确保 departure_time 合理）
@@ -742,10 +798,12 @@ class DispatchDecisionEngine:
                 "position": node.position,
                 "arrival_time": node.arrival_time,
                 "departure_time": node.departure_time,
-                "order_id": node.order_id,
+                "order_id": str(node.order_id or ""),
+                "action": str(getattr(node, "action", "") or ""),
             }
             for node in new_route.nodes
             if node.node_type in ("customer", "recovery", "station")
+            and (not patch_enabled or str(node.order_id or "") in replace_ids)
         ]
 
         # 稳定增量：保留旧 future 的相对顺序，只插入新停靠，避免前批动态单被后批重排。
@@ -763,6 +821,18 @@ class DispatchDecisionEngine:
                     return i
             return -1
 
+        def _last_idx_of_order(seq: list[dict], order_id: str) -> int:
+            for i in range(len(seq) - 1, -1, -1):
+                if str(seq[i].get("order_id", "") or "") == order_id:
+                    return i
+            return -1
+
+        def _first_idx_of_order(seq: list[dict], order_id: str) -> int:
+            for i, stop in enumerate(seq):
+                if str(stop.get("order_id", "") or "") == order_id:
+                    return i
+            return -1
+
         inserted_via_anchor = 0
         for idx, stop in enumerate(new_route_stops):
             key = _stop_key(stop)
@@ -771,21 +841,37 @@ class DispatchDecisionEngine:
 
             insert_at = len(merged)
 
-            # 先找前驱锚点：尽量插在新路由语义上的前驱之后。
-            for prev in reversed(new_route_stops[:idx]):
-                prev_key = _stop_key(prev)
-                prev_idx = _last_idx_of_key(merged, prev_key)
-                if prev_idx >= 0:
-                    insert_at = prev_idx + 1
-                    break
+            order_id = str(stop.get("order_id", "") or "")
+            if patch_enabled and order_id:
+                same_order_prev_idx = _last_idx_of_order(merged, order_id)
+                if same_order_prev_idx >= 0:
+                    insert_at = same_order_prev_idx + 1
+                else:
+                    anchor = patch_anchor_by_order.get(order_id, {})
+                    after_order_id = str(anchor.get("after_order_id", "") or "")
+                    before_order_id = str(anchor.get("before_order_id", "") or "")
+                    after_idx = _last_idx_of_order(merged, after_order_id) if after_order_id else -1
+                    before_idx = _first_idx_of_order(merged, before_order_id) if before_order_id else -1
+                    if after_idx >= 0:
+                        insert_at = after_idx + 1
+                    elif before_idx >= 0:
+                        insert_at = before_idx
             else:
-                # 若没有前驱锚点，再找后继锚点并插到其前。
-                for nxt in new_route_stops[idx + 1:]:
-                    nxt_key = _stop_key(nxt)
-                    nxt_idx = _first_idx_of_key(merged, nxt_key)
-                    if nxt_idx >= 0:
-                        insert_at = nxt_idx
+                # 先找前驱锚点：尽量插在新路由语义上的前驱之后。
+                for prev in reversed(new_route_stops[:idx]):
+                    prev_key = _stop_key(prev)
+                    prev_idx = _last_idx_of_key(merged, prev_key)
+                    if prev_idx >= 0:
+                        insert_at = prev_idx + 1
                         break
+                else:
+                    # 若没有前驱锚点，再找后继锚点并插到其前。
+                    for nxt in new_route_stops[idx + 1:]:
+                        nxt_key = _stop_key(nxt)
+                        nxt_idx = _first_idx_of_key(merged, nxt_key)
+                        if nxt_idx >= 0:
+                            insert_at = nxt_idx
+                            break
 
             merged.insert(insert_at, dict(stop))
             inserted_via_anchor += 1
@@ -844,6 +930,7 @@ class DispatchDecisionEngine:
                     "arrival_time": n.arrival_time,
                     "departure_time": n.departure_time,
                     "order_id": n.order_id,
+                    "action": str(getattr(n, "action", "") or ""),
                 }
                 for n in rebuilt_route.nodes
                 if n.node_type in ("customer", "recovery", "station")
@@ -885,17 +972,40 @@ class DispatchDecisionEngine:
             return
 
         arrivals_by_node: dict[str, list[float]] = {}
+        arrivals_by_order_node: dict[tuple[str, str], list[float]] = {}
         for stop in planned_stops:
-            node_id = stop.get("node_id")
+            node_id = str(stop.get("node_id", "") or "")
             if not node_id:
                 continue
             arr = float(stop.get("arrival_time", float("inf")))
             if not math.isfinite(arr):
                 continue
             arrivals_by_node.setdefault(node_id, []).append(arr)
+            order_id = str(stop.get("order_id", "") or "")
+            if order_id:
+                arrivals_by_order_node.setdefault((order_id, node_id), []).append(arr)
 
         for node_id in arrivals_by_node:
             arrivals_by_node[node_id].sort()
+        for key in arrivals_by_order_node:
+            arrivals_by_order_node[key].sort()
+
+        def _active_ga_launch_order_id(drone, launch_station_id: str) -> str:
+            segments = getattr(drone, "_ga_runtime_segments", []) or []
+            if not segments:
+                return ""
+            current_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+            matching = [
+                segment for segment in segments
+                if bool(getattr(segment, "truck_launch", False))
+                and str(getattr(segment, "launch_node_id", "") or "") == launch_station_id
+            ]
+            if not matching:
+                return ""
+            for segment in matching:
+                if int(getattr(segment, "start_idx", 0) or 0) >= current_idx:
+                    return str(getattr(segment, "order_id", "") or "")
+            return str(getattr(matching[-1], "order_id", "") or "")
 
         updated = 0
         for drone in self.entity_mgr.drones.values():
@@ -906,7 +1016,12 @@ class DispatchDecisionEngine:
             if not launch_station_id:
                 continue
 
-            station_arrivals = arrivals_by_node.get(launch_station_id, [])
+            active_order_id = _active_ga_launch_order_id(drone, launch_station_id)
+            station_arrivals = []
+            if self.solver_name == "ga_mmce" and active_order_id:
+                station_arrivals = arrivals_by_order_node.get((active_order_id, launch_station_id), [])
+            if not station_arrivals:
+                station_arrivals = arrivals_by_node.get(launch_station_id, [])
             future_arrivals = [
                 t for t in station_arrivals
                 if t >= current_time - 1e-6
@@ -920,11 +1035,12 @@ class DispatchDecisionEngine:
                         if float(s.get("arrival_time", float("inf"))) >= current_time - 1e-6
                     ]
                     logger.warning(
-                        "[DispatchDecisionEngine] 卡车 %s 未找到等待无人机 %s 的起飞站 %s；"
+                        "[DispatchDecisionEngine] 卡车 %s 未找到等待无人机 %s 的起飞站 %s order=%s；"
                         "未来停靠=%s",
                         truck.truck_id,
                         drone.drone_id,
                         launch_station_id,
+                        active_order_id or "-",
                         future_node_ids[:12],
                     )
                     drone._last_missing_launch_station_log_time = current_time
@@ -941,6 +1057,17 @@ class DispatchDecisionEngine:
 
             drone.scheduled_launch_time = target_launch
             updated += 1
+            logger.info(
+                "[DispatchDecisionEngine] GA-MMCE launch sync truck=%s drone=%s order=%s station=%s "
+                "station_arrival=%.1f scheduled_launch_time=%.1f current_time=%.1f",
+                truck.truck_id,
+                drone.drone_id,
+                active_order_id or "-",
+                launch_station_id,
+                station_arrival,
+                target_launch,
+                current_time,
+            )
 
         if updated > 0:
             logger.info(
@@ -1323,7 +1450,12 @@ class DispatchDecisionEngine:
                 return "从仓库出发"
         elif node.node_type == "customer":
             return f"配送订单 {node.order_id}"
-        elif node.node_type == "recovery":
+        action = str(getattr(node, "action", "") or "")
+        if action == "launch":
+            return f"放飞无人机（订单: {node.order_id or '-'}）"
+        if action == "recover":
+            return f"回收无人机（订单: {node.order_id or '-'}）"
+        if node.node_type == "recovery":
             launch_orders = [
                 alloc.order_id for alloc in allocations
                 if alloc.feasible and alloc.mode in ("B_WAIT", "B_DYNAMIC") and alloc.launch_station_id == node.node_id
