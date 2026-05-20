@@ -217,6 +217,7 @@ def initialize_population(
     prefer_bc_warm_start: bool = False,
     dynamic_fill_from_warm_start: bool = False,
     dynamic_mutable_order_ids: list[str] | None = None,
+    avoid_truck_only_initial_population: bool = False,
 ) -> list[Individual]:
     _check_inputs(order_ids, gene_pool, support_node_ids)
     if pop_size <= 0:
@@ -225,6 +226,13 @@ def initialize_population(
     order_set = set(order_ids)
     gene_set = set(gene_pool)
     population: list[Individual] = []
+    avoid_truck_only = bool(avoid_truck_only_initial_population and _has_bc_gene(gene_pool))
+
+    def append_candidate(candidate: Individual) -> bool:
+        if avoid_truck_only and _is_truck_only_individual(candidate):
+            return False
+        population.append(candidate)
+        return True
 
     if warm_start:
         if prefer_bc_warm_start:
@@ -249,7 +257,7 @@ def initialize_population(
                 fixed_tail_gene_by_order,
             )
             if copied is not None:
-                population.append(copied)
+                append_candidate(copied)
             if len(population) >= pop_size:
                 return population[:pop_size]
 
@@ -262,10 +270,10 @@ def initialize_population(
             fixed_tail_gene_by_order,
         )
         if copied is not None:
-            population.append(copied)
+            append_candidate(copied)
 
     if use_truck_only_seed:
-        population.append(
+        append_candidate(
             enforce_fixed_tail(
                 make_truck_only_individual(order_ids),
                 fixed_tail_order_ids,
@@ -274,7 +282,7 @@ def initialize_population(
         )
 
     if use_obl_seed and population:
-        population.append(
+        append_candidate(
             enforce_fixed_tail(
                 make_obl_individual(
                     population[0],
@@ -294,7 +302,7 @@ def initialize_population(
             if order_id in order_set and b_gene in gene_set
         }
         if valid_b_seeds:
-            population.append(
+            append_candidate(
                 enforce_fixed_tail(
                     make_combined_b_seed_individual(order_ids, valid_b_seeds),
                     fixed_tail_order_ids,
@@ -309,7 +317,7 @@ def initialize_population(
             if seed_data is None:
                 continue
             b_gene, rv = seed_data
-            population.append(
+            append_candidate(
                 enforce_fixed_tail(
                     make_single_b_seed_individual(order_ids, order_id, b_gene, rv),
                     fixed_tail_order_ids,
@@ -327,10 +335,12 @@ def initialize_population(
             {"A": 0.65, "B": 0.35, "C": 0.0},
             {"A": 0.40, "B": 0.25, "C": 0.35},
         ]
+        if avoid_truck_only:
+            recipes = [recipe for recipe in recipes if recipe.get("A", 0.0) < 1.0]
         index = 0
         while len(population) < target:
             recipe = recipes[index % len(recipes)]
-            population.append(
+            append_candidate(
                 enforce_fixed_tail(
                     make_random_individual(
                         order_ids,
@@ -360,15 +370,15 @@ def initialize_population(
                 allow_c_recover_station=allow_c_recover_station,
                 mode_probabilities=mutation_mode_probabilities,
             )
-            population.append(
+            if append_candidate(
                 enforce_fixed_tail(
                     base,
                     fixed_tail_order_ids,
                     fixed_tail_gene_by_order,
                 )
-            )
-            continue
-        population.append(
+            ):
+                continue
+        append_candidate(
             enforce_fixed_tail(
                 make_random_individual(
                     order_ids,
@@ -387,6 +397,14 @@ def initialize_population(
 
 def _bc_count(ind: Individual) -> int:
     return sum(1 for gene in ind.assignment if str(gene).startswith("B_") or str(gene).startswith("C_"))
+
+
+def _has_bc_gene(gene_pool: list[str]) -> bool:
+    return any(str(gene).startswith("B_") or str(gene).startswith("C_") for gene in gene_pool)
+
+
+def _is_truck_only_individual(ind: Individual) -> bool:
+    return bool(ind.assignment) and all(str(gene) == "A" for gene in ind.assignment)
 
 
 def _mutate_mutable_orders_only(

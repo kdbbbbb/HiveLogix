@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import json
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -97,9 +98,19 @@ class DispatchDecisionEngine:
         self._ga_delayed_order_first_seen: dict[str, float] = {}
         self._ga_delayed_order_last_retry: dict[str, float] = {}
         self._ga_last_pending_replan_time: float = -1e9
+        self._ga_last_pending_replan_wall_time: float = -1e9
         self._ga_pending_replan_interval_s: float = 120.0
         self._ga_pending_retry_min_interval_s: float = 5.0
-        self._ga_pending_replan_batch_size: int = 8
+        self._ga_pending_global_min_interval_s: float = 30.0
+        self._ga_pending_wall_min_interval_s: float = 30.0
+        self._ga_pending_urgent_retry_interval_s: float = 60.0
+        self._ga_pending_critical_retry_interval_s: float = 20.0
+        self._ga_pending_critical_wall_min_interval_s: float = 15.0
+        self._ga_pending_critical_deadline_slack_s: float = 120.0
+        self._ga_pending_min_truck_move_m: float = 500.0
+        self._ga_pending_replan_batch_size: int | None = None
+        self._ga_last_pending_replan_order_ids: set[str] = set()
+        self._ga_last_pending_replan_truck_positions: dict[str, tuple[float, float]] = {}
         self._ga_depot_direct_radius_m: float = 800.0
         self._ga_truck_direct_radius_m: float = 900.0
         self._ga_urgent_deadline_slack_s: float = 300.0
@@ -311,6 +322,9 @@ class DispatchDecisionEngine:
             self._ga_admission_delayed_ids.clear()
             self._ga_delayed_order_first_seen.clear()
             self._ga_delayed_order_last_retry.clear()
+            self._ga_last_pending_replan_wall_time = -1e9
+            self._ga_last_pending_replan_order_ids.clear()
+            self._ga_last_pending_replan_truck_positions.clear()
             return None
 
         for oid in list(self._ga_admission_delayed_ids):
@@ -327,20 +341,56 @@ class DispatchDecisionEngine:
             oid for oid, order in pending.items()
             if self._is_ga_order_deadline_tight(order, current_time)
             and current_time - self._ga_delayed_order_last_retry.get(oid, -1e9)
-            >= self._ga_pending_retry_min_interval_s
+            >= self._ga_pending_urgent_retry_interval_s
+        ]
+        critical_due = [
+            oid for oid, order in pending.items()
+            if self._ga_order_deadline_slack(order, current_time)
+            <= self._ga_pending_critical_deadline_slack_s
+            and current_time - self._ga_delayed_order_last_retry.get(oid, -1e9)
+            >= self._ga_pending_critical_retry_interval_s
         ]
         interval_due = (
             current_time - self._ga_last_pending_replan_time
             >= self._ga_pending_replan_interval_s
         )
+        global_cooldown_due = (
+            current_time - self._ga_last_pending_replan_time
+            >= self._ga_pending_global_min_interval_s
+        )
         if not urgent_due and not interval_due:
             return None
+        if not global_cooldown_due and not critical_due:
+            return None
+        now_wall = time.monotonic()
+        wall_elapsed = now_wall - self._ga_last_pending_replan_wall_time
+        wall_required = (
+            self._ga_pending_critical_wall_min_interval_s
+            if critical_due
+            else self._ga_pending_wall_min_interval_s
+        )
+        if wall_elapsed < wall_required:
+            return None
+        if (
+            urgent_due
+            and not interval_due
+            and not critical_due
+            and not self._ga_pending_replan_material_change(pending, current_time)
+        ):
+            return None
 
-        selected = self._select_ga_pending_replan_orders(pending, current_time)
+        forced_ids = None if interval_due else set(urgent_due) | set(critical_due)
+        selected = self._select_ga_pending_replan_orders(
+            pending,
+            current_time,
+            forced_ids=forced_ids,
+        )
         if not selected:
             return None
 
         self._ga_last_pending_replan_time = current_time
+        self._ga_last_pending_replan_wall_time = now_wall
+        self._record_ga_pending_replan_state(pending, current_time)
         for oid in selected:
             self._ga_delayed_order_last_retry[oid] = current_time
 
@@ -706,7 +756,12 @@ class DispatchDecisionEngine:
                 routes[tid] = route
         return allocations, routes
 
-    def _select_ga_pending_replan_orders(self, pending: dict, current_time: float) -> list[str]:
+    def _select_ga_pending_replan_orders(
+        self,
+        pending: dict,
+        current_time: float,
+        forced_ids: set[str] | None = None,
+    ) -> list[str]:
         def sort_key(item: tuple[str, object]) -> tuple[int, float, float, str]:
             oid, order = item
             delayed_rank = 0 if oid in self._ga_admission_delayed_ids else 1
@@ -721,16 +776,49 @@ class DispatchDecisionEngine:
         eligible = [
             (oid, order)
             for oid, order in pending.items()
+            if forced_ids is None or oid in forced_ids
             if current_time - self._ga_delayed_order_last_retry.get(oid, -1e9)
             >= self._ga_pending_retry_min_interval_s
         ]
-        return [
-            oid for oid, _ in sorted(eligible, key=sort_key)[: self._ga_pending_replan_batch_size]
-        ]
+        ordered = [oid for oid, _ in sorted(eligible, key=sort_key)]
+        batch_size = self._ga_pending_replan_batch_size
+        if batch_size is None or int(batch_size) <= 0:
+            return ordered
+        return ordered[: int(batch_size)]
 
     def _is_ga_order_deadline_tight(self, order, current_time: float) -> bool:
+        return self._ga_order_deadline_slack(order, current_time) <= self._ga_urgent_deadline_slack_s
+
+    def _ga_order_deadline_slack(self, order, current_time: float) -> float:
         deadline = self._safe_float(getattr(order, "deadline", math.inf), math.inf)
-        return deadline - current_time <= self._ga_urgent_deadline_slack_s
+        return deadline - current_time
+
+    def _ga_pending_replan_material_change(self, pending: dict, current_time: float) -> bool:
+        pending_ids = set(pending)
+        if pending_ids != self._ga_last_pending_replan_order_ids:
+            return True
+        if not self._ga_last_pending_replan_truck_positions:
+            return True
+        for truck_id, truck in self.entity_mgr.trucks.items():
+            pos = truck.get_location(current_time)
+            last = self._ga_last_pending_replan_truck_positions.get(truck_id)
+            if last is None:
+                return True
+            dx = self._safe_float(getattr(pos, "x", math.inf), math.inf) - last[0]
+            dy = self._safe_float(getattr(pos, "y", math.inf), math.inf) - last[1]
+            if math.hypot(dx, dy) >= self._ga_pending_min_truck_move_m:
+                return True
+        return False
+
+    def _record_ga_pending_replan_state(self, pending: dict, current_time: float) -> None:
+        self._ga_last_pending_replan_order_ids = set(pending)
+        self._ga_last_pending_replan_truck_positions = {}
+        for truck_id, truck in self.entity_mgr.trucks.items():
+            pos = truck.get_location(current_time)
+            self._ga_last_pending_replan_truck_positions[truck_id] = (
+                self._safe_float(getattr(pos, "x", math.inf), math.inf),
+                self._safe_float(getattr(pos, "y", math.inf), math.inf),
+            )
 
     def _nearest_truck_distance(self, order, current_time: float) -> float:
         if not self.entity_mgr.trucks:

@@ -40,6 +40,7 @@ class GAConfig:
     dynamic_archive_seed_count: int = 16
     dynamic_warm_start_limit: int = 24
     dynamic_skip_ga_when_fast_incumbent_safe: bool = True
+    dynamic_avoid_truck_only_initial_population: bool = False
 
     mutation_mode_prob_a: float = 0.40
     mutation_mode_prob_b: float = 0.25
@@ -125,16 +126,20 @@ DYNAMIC_GA_CONFIG: dict[str, Any] = {
     "early_stopping_patience": 10,
     "improvement_tolerance": 1e-6,
     "log_interval": 5,
-    "time_budget_seconds": 3.0,
+    "time_budget_seconds": 2.5,
     "enable_csv": True,
     "enable_png": False,
     "use_greedy_seed": False,
     "use_truck_only_seed": False,
     "use_obl_seed": False,
-    "use_balanced_initialization": False,
+    "use_balanced_initialization": True,
+    "use_b_seeded_initialization": True,
+    "mutation_mode_prob_a": 0.20,
+    "mutation_mode_prob_b": 0.40,
+    "mutation_mode_prob_c": 0.40,
     "use_warm_start": True,
     "warm_start_mutations": 0,
-    "reopt_window_size": 8,
+    "reopt_window_size": None,
     "fast_incumbent_enabled": True,
     "fast_incumbent_eval_count": 8,
     "fast_incumbent_budget_seconds": 0.3,
@@ -146,6 +151,7 @@ DYNAMIC_GA_CONFIG: dict[str, Any] = {
     "dynamic_archive_seed_count": 16,
     "dynamic_warm_start_limit": 24,
     "dynamic_skip_ga_when_fast_incumbent_safe": True,
+    "dynamic_avoid_truck_only_initial_population": True,
     "diagnostics_label": "dynamic",
 }
 

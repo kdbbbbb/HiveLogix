@@ -159,6 +159,10 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
     setattr(snapshot, "_ga_reoptimized_order_ids", list(reoptimized_ids))
 
     context = build_ga_context(snapshot, dynamic_config, mode="dynamic")
+    avoid_truck_only_initial = bool(
+        getattr(dynamic_config, "dynamic_avoid_truck_only_initial_population", False)
+        and _has_payload_feasible_bc_order(snapshot, reoptimized_ids, planning_orders, context)
+    )
     previous_best_seeds = build_warm_start_population(
         previous_best=previous_best,
         completed_ids=set(buckets.completed),
@@ -172,6 +176,8 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
         frozen_future_order_ids=fixed_tail_order_ids,
         fixed_tail_gene_by_order=fixed_tail_gene_by_order,
         orders=planning_orders,
+        station_locations=_support_locations(snapshot, context.station_ids),
+        avoid_truck_only_initial_population=avoid_truck_only_initial,
         allow_c_recover_station=dynamic_config.allow_depot_drone_recover_at_station,
         mutation_count=int(dynamic_config.warm_start_mutations or 0),
     )
@@ -213,6 +219,7 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
         planning_orders=planning_orders,
         new_order_ids=list(buckets.new),
         context=context,
+        reject_truck_only=avoid_truck_only_initial,
     )
     warm_starts = _merge_warm_starts(
         fast_incumbent_seeds + archive_restore_seeds + archive_seeds + previous_best_seeds,
@@ -472,6 +479,8 @@ def build_warm_start_population(
     frozen_future_order_ids: list[str],
     fixed_tail_gene_by_order: dict[str, tuple[str, dict[str, str] | None]] | None = None,
     orders: dict[str, Any] | None = None,
+    station_locations: dict[str, Any] | None = None,
+    avoid_truck_only_initial_population: bool = False,
     allow_c_recover_station: bool = True,
     mutation_count: int = 0,
 ) -> list[Individual]:
@@ -494,8 +503,20 @@ def build_warm_start_population(
     if base is not None:
         population.append(_with_new_orders_appended(base, new_ids, gene_pool, depot_ids, station_ids, allow_c_recover_station))
         population.append(_with_new_orders_nearest(base, new_ids, gene_pool, depot_ids, station_ids, orders, allow_c_recover_station))
+        station_seed = _station_cluster_b_seed(
+            base,
+            order_ids,
+            reoptimized_order_ids,
+            gene_pool,
+            station_ids,
+            orders,
+            station_locations,
+        )
+        if station_seed is not None:
+            population.append(station_seed)
 
-    for mode in ("A", "B", "C"):
+    seed_modes = ("B", "C") if avoid_truck_only_initial_population else ("A", "B", "C")
+    for mode in seed_modes:
         gene = _first_gene_for_mode(gene_pool, mode)
         if gene is not None:
             population.append(
@@ -561,6 +582,8 @@ def build_warm_start_population(
             _repair_rendezvous_to_context(ind, gene_pool, depot_ids, station_ids, allow_c_recover_station)
             enforce_fixed_tail(ind, frozen_future_order_ids, fixed_tail_gene_by_order)
             _repair_rendezvous_to_context(ind, gene_pool, depot_ids, station_ids, allow_c_recover_station)
+            if avoid_truck_only_initial_population and _is_truck_only_individual(ind):
+                continue
             key = (tuple(ind.sequence), tuple(ind.assignment), repr(ind.rendezvous))
             if key in seen:
                 continue
@@ -783,6 +806,7 @@ def _dedupe_and_validate_seeds(
     station_ids: list[str],
     allow_c_recover_station: bool,
     max_count: int,
+    reject_truck_only: bool = False,
 ) -> list[Individual]:
     repaired: list[Individual] = []
     seen: set[tuple[tuple[str, ...], tuple[str, ...], str]] = set()
@@ -799,6 +823,8 @@ def _dedupe_and_validate_seeds(
             )
             _repair_rendezvous_to_context(candidate, gene_pool, depot_ids, station_ids, allow_c_recover_station)
             _validate_seed_with_context(candidate, gene_pool, depot_ids, station_ids)
+            if reject_truck_only and _has_bc_gene(gene_pool) and _is_truck_only_individual(candidate):
+                continue
             key = (tuple(candidate.sequence), tuple(candidate.assignment), repr(candidate.rendezvous))
             if key in seen:
                 continue
@@ -1157,7 +1183,11 @@ def _select_reoptimization_window(
             count=neighbor_count,
             event_time=event_time,
         )
-        frozen_future = [oid for oid in pending_ids if oid not in set(selected_pending)]
+        previous_ids = set(getattr(previous_best, "sequence", []) or [])
+        frozen_future = [
+            oid for oid in pending_ids
+            if oid in previous_ids and oid not in set(selected_pending)
+        ]
         return list(dict.fromkeys(new_ids + selected_pending)), frozen_future
 
     previous_rank = {oid: i for i, oid in enumerate(previous_best.sequence)} if previous_best is not None else {}
@@ -1228,6 +1258,7 @@ def _fast_incumbent_plan(
     planning_orders: dict[str, Any],
     new_order_ids: list[str],
     context: Any,
+    reject_truck_only: bool = False,
 ) -> tuple[DispatchPlan | None, dict[str, Any], list[Individual]]:
     max_eval = max(0, int(getattr(config, "fast_incumbent_eval_count", 8) or 0))
     budget_seconds = max(0.0, float(getattr(config, "fast_incumbent_budget_seconds", 0.3) or 0.0))
@@ -1250,6 +1281,7 @@ def _fast_incumbent_plan(
         order_ids=list(planning_orders),
         allow_c_recover_station=config.allow_depot_drone_recover_at_station,
         max_count=max_eval * 3,
+        reject_truck_only=reject_truck_only,
     )
     if not fast_seeds:
         if bool(getattr(config, "dynamic_allow_new_order_pending", True)) and previous_plan is not None:
@@ -1338,18 +1370,16 @@ def _build_fast_incumbent_seeds(
     order_ids: list[str],
     allow_c_recover_station: bool,
     max_count: int,
+    reject_truck_only: bool = False,
 ) -> list[Individual]:
     if max_count <= 0:
         return []
     candidates: list[Individual] = []
     new_set = set(str(oid) for oid in new_order_ids)
+    preferred_modes = ("C", "B") if reject_truck_only else ("C", "B", "A")
     preferred_genes = [
         gene
-        for gene in (
-            _first_gene_for_mode(gene_pool, "C"),
-            _first_gene_for_mode(gene_pool, "B"),
-            _first_gene_for_mode(gene_pool, "A"),
-        )
+        for gene in (_first_gene_for_mode(gene_pool, mode) for mode in preferred_modes)
         if gene is not None
     ]
     for seed in seed_candidates:
@@ -1380,6 +1410,7 @@ def _build_fast_incumbent_seeds(
         station_ids=station_ids,
         allow_c_recover_station=allow_c_recover_station,
         max_count=max_count,
+        reject_truck_only=reject_truck_only,
     )
 
 
@@ -2157,6 +2188,68 @@ def _with_new_orders_deadline(
     return ind
 
 
+def _station_cluster_b_seed(
+    base: Individual | None,
+    order_ids: list[str],
+    mutable_order_ids: Iterable[str],
+    gene_pool: list[str],
+    station_ids: list[str],
+    orders: dict[str, Any] | None,
+    station_locations: dict[str, Any] | None,
+) -> Individual | None:
+    b_genes = [str(gene) for gene in gene_pool if str(gene).startswith("B_")]
+    if not b_genes or not station_ids:
+        return None
+
+    orders = orders or {}
+    station_locations = station_locations or {}
+    mutable = [str(oid) for oid in mutable_order_ids if str(oid) in set(order_ids)]
+    if not mutable:
+        return None
+
+    by_order: dict[str, tuple[str, Any]] = {}
+    if base is not None:
+        by_order.update(
+            {
+                str(oid): (str(gene), copy.deepcopy(rv))
+                for oid, gene, rv in zip(base.sequence, base.assignment, base.rendezvous)
+                if str(oid) in set(order_ids)
+            }
+        )
+
+    clustered: list[tuple[str, str, float, float]] = []
+    for oid in mutable:
+        station_id, station_dist = _nearest_station_for_order(orders.get(oid), station_ids, station_locations)
+        if not station_id:
+            continue
+        deadline = _safe_float(_read_field(orders.get(oid), "deadline", math.inf), math.inf)
+        clustered.append((station_id, oid, deadline, station_dist))
+
+    if not clustered:
+        return None
+
+    clustered.sort(key=lambda item: (item[0], item[2], item[3], item[1]))
+    for idx, (station_id, oid, _, _) in enumerate(clustered):
+        by_order[oid] = (
+            b_genes[idx % len(b_genes)],
+            {"launch": station_id, "recover": station_id},
+        )
+
+    clustered_ids = [oid for _, oid, _, _ in clustered]
+    remaining = [oid for oid in order_ids if oid not in set(clustered_ids)]
+    sequence = clustered_ids + remaining
+    for oid in sequence:
+        by_order.setdefault(oid, ("A", None))
+
+    ind = Individual(
+        sequence=list(sequence),
+        assignment=[by_order[oid][0] for oid in sequence],
+        rendezvous=[copy.deepcopy(by_order[oid][1]) for oid in sequence],
+    )
+    ind.validate()
+    return ind
+
+
 def _new_orders_with_mode(
     base: Individual | None,
     order_ids: list[str],
@@ -2237,6 +2330,14 @@ def _preferred_gene(gene_pool: list[str], modes: Iterable[str]) -> str:
     return "A"
 
 
+def _has_bc_gene(gene_pool: list[str]) -> bool:
+    return any(str(gene).startswith("B_") or str(gene).startswith("C_") for gene in gene_pool)
+
+
+def _is_truck_only_individual(ind: Individual) -> bool:
+    return bool(getattr(ind, "assignment", None)) and all(str(gene) == "A" for gene in ind.assignment)
+
+
 def _first_gene_for_mode(gene_pool: list[str], mode: str) -> str | None:
     if mode == "A":
         return "A" if "A" in gene_pool else None
@@ -2245,6 +2346,65 @@ def _first_gene_for_mode(gene_pool: list[str], mode: str) -> str | None:
         if gene.startswith(prefix):
             return gene
     return None
+
+
+def _support_locations(state: Any, node_ids: Iterable[str]) -> dict[str, Any]:
+    mgr = _entity_mgr(state)
+    depots = _read_field(mgr, "depots", {}) or {}
+    stations = _read_field(mgr, "stations", {}) or {}
+    locations: dict[str, Any] = {}
+    for node_id in node_ids:
+        node_key = str(node_id)
+        node = stations.get(node_key) if isinstance(stations, dict) else None
+        if node is None and isinstance(depots, dict):
+            node = depots.get(node_key)
+        loc = _read_field(node, "location") if node is not None else None
+        if loc is not None:
+            locations[node_key] = loc
+    return locations
+
+
+def _nearest_station_for_order(
+    order: Any,
+    station_ids: list[str],
+    station_locations: dict[str, Any],
+) -> tuple[str | None, float]:
+    delivery = _read_field(order, "delivery_loc")
+    best_id: str | None = None
+    best_dist = math.inf
+    for station_id in station_ids:
+        loc = station_locations.get(str(station_id))
+        dist = _distance(delivery, loc)
+        if dist < best_dist:
+            best_id = str(station_id)
+            best_dist = dist
+    return best_id, best_dist
+
+
+def _has_payload_feasible_bc_order(
+    snapshot: Any,
+    order_ids: Iterable[str],
+    orders: dict[str, Any],
+    context: Any,
+) -> bool:
+    mgr = _entity_mgr(snapshot)
+    drones = _read_field(mgr, "drones", {}) or {}
+
+    def capacity(drone_id: str) -> float:
+        drone = drones.get(str(drone_id)) if isinstance(drones, dict) else None
+        return _safe_float(_read_field(drone, "payload_capacity", 0.0), 0.0)
+
+    b_capacity = max((capacity(drone_id) for drone_id in getattr(context, "truck_drone_ids", []) or []), default=0.0)
+    c_capacity = max((capacity(drone_id) for drone_id in getattr(context, "depot_drone_ids", []) or []), default=0.0)
+    if b_capacity <= 0.0 and c_capacity <= 0.0:
+        return False
+
+    for order_id in order_ids:
+        order = orders.get(str(order_id))
+        payload = _safe_float(_read_field(order, "payload_weight", math.inf), math.inf)
+        if payload <= max(b_capacity, c_capacity):
+            return True
+    return False
 
 
 def _nearest_order_index(order_id: str, sequence: list[str], orders: dict[str, Any]) -> int | None:

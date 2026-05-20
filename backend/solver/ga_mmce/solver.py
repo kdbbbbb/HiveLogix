@@ -252,6 +252,11 @@ class GAMMCESolver:
 
         greedy_seed = self._build_greedy_seed(state, context)
         b_seed_rendezvous_by_order = self._build_b_precheck_and_seed_data(state, context)
+        avoid_truck_only_initial = (
+            self._active_diagnostics_label == "dynamic"
+            and bool(getattr(self.config, "dynamic_avoid_truck_only_initial_population", False))
+            and self._has_feasible_bc_precheck_candidate()
+        )
         warm_start_seeds = self._prepare_warm_start_seeds(
             self._normalize_warm_start(warm_start),
             state,
@@ -296,6 +301,7 @@ class GAMMCESolver:
                 str(order_id)
                 for order_id in getattr(state, "_ga_reoptimized_order_ids", []) or []
             ],
+            avoid_truck_only_initial_population=avoid_truck_only_initial,
         )
         if not population:
             plan = self._empty_plan(dispatch_type=dispatch_type, reason="population_init_failed")
@@ -618,6 +624,14 @@ class GAMMCESolver:
         self._debug_write(f"b_candidate_precheck_seeded_orders={sorted(result)}")
         return result
 
+    def _has_feasible_bc_precheck_candidate(self) -> bool:
+        for row in self._b_precheck_by_order.values():
+            for mode in ("B", "C"):
+                candidate = row.get(mode, {})
+                if bool(candidate.get("feasible", False)):
+                    return True
+        return False
+
     def _order_payload(self, state: Any, order_id: str) -> float:
         orders = self.evaluator._mapping(state, "orders") if hasattr(self.evaluator, "_mapping") else {}
         order = orders.get(order_id) if isinstance(orders, dict) else None
@@ -938,7 +952,12 @@ class GAMMCESolver:
     def _static_plan_cache_reuse_enabled(self) -> bool:
         if self._reuse_static_plan_cache_override is not None:
             return self._reuse_static_plan_cache_override
-        return self._truthy_env(os.environ.get(STATIC_PLAN_CACHE_ENV))
+        env_value = os.environ.get(STATIC_PLAN_CACHE_ENV)
+        if env_value is None:
+            # Cache entries are signature-checked before use. Reusing by default
+            # avoids recomputing the same static order set on every dispatch.
+            return True
+        return self._truthy_env(env_value)
 
     @staticmethod
     def _truthy_env(value: Any) -> bool:
@@ -1054,8 +1073,22 @@ class GAMMCESolver:
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("wb") as fh:
+            if path.exists():
+                try:
+                    path.chmod(0o666)
+                except Exception:
+                    pass
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("wb") as fh:
                 pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            try:
+                os.replace(tmp_path, path)
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
             self._debug_write(f"static_plan_cache saved path={path}")
         except Exception as exc:
             logger.warning("[GA-MMCE] 静态计划缓存写入失败: %s", exc)
