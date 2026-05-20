@@ -635,7 +635,10 @@ class PhysicalEvaluator:
             candidate.score_total = math.inf
             return candidate
 
-        candidate.cost_dist = 0.0
+        candidate.cost_dist = (
+            candidate.truck_distance * self._config_float("weight_truck_distance", 0.08)
+            + candidate.uav_distance * self._config_float("weight_uav_distance", 0.015)
+        )
         candidate.cost_energy = (
             candidate.truck_energy + candidate.uav_energy
         ) * self._config_float("weight_energy", 0.02)
@@ -649,7 +652,8 @@ class PhysicalEvaluator:
             else 0.0
         )
         candidate.score_total = (
-            candidate.cost_energy
+            candidate.cost_dist
+            + candidate.cost_energy
             + candidate.cost_penalty
             - candidate.mode_reward
         )

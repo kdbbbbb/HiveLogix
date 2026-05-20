@@ -315,8 +315,8 @@ class GADecoder:
     ) -> dict[str, float]:
         raw_truck_distance = sum(float(c.truck_distance or 0.0) for c in candidates)
         raw_uav_distance = sum(float(c.uav_distance or 0.0) for c in candidates)
-        truck_distance_cost = 0.0
-        uav_distance_cost = 0.0
+        truck_distance_cost = raw_truck_distance * float(self.config.weight_truck_distance)
+        uav_distance_cost = raw_uav_distance * float(self.config.weight_uav_distance)
         energy_cost = sum(float(c.cost_energy or 0.0) for c in candidates)
         time_cost = float(plan_completion_time) * float(self.config.weight_completion)
         waiting_cost = sum(float(c.waiting_time or 0.0) for c in candidates) * float(self.config.weight_waiting)

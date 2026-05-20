@@ -557,6 +557,9 @@ def _resolve_support_entity(entity_mgr: Any, node_id: str) -> Any | None:
 
 
 def _clear_obsolete_ga_drone_routes(*, entity_mgr: Any, plan: Any) -> None:
+    if bool((getattr(plan, "summary", {}) or {}).get("ga_partial_plan", False)):
+        return
+
     planned_by_drone: dict[str, set[str]] = defaultdict(set)
     for alloc in getattr(plan, "allocations", []) or []:
         if (

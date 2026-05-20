@@ -92,6 +92,18 @@ class DispatchDecisionEngine:
         self._dispatch_count = 0
         self._active_scene_id: str | None = None
         self._active_path_planner = None
+        # GA-MMCE 动态订单准入/延迟池。仅由 solver_name == "ga_mmce" 路径使用。
+        self._ga_admission_delayed_ids: set[str] = set()
+        self._ga_delayed_order_first_seen: dict[str, float] = {}
+        self._ga_delayed_order_last_retry: dict[str, float] = {}
+        self._ga_last_pending_replan_time: float = -1e9
+        self._ga_pending_replan_interval_s: float = 120.0
+        self._ga_pending_retry_min_interval_s: float = 5.0
+        self._ga_pending_replan_batch_size: int = 8
+        self._ga_depot_direct_radius_m: float = 800.0
+        self._ga_truck_direct_radius_m: float = 900.0
+        self._ga_urgent_deadline_slack_s: float = 300.0
+        self._ga_direct_deadline_grace_s: float = 30.0
 
     def set_solver(self, solver_name: str) -> None:
         """按名称切换求解器实例。"""
@@ -241,6 +253,14 @@ class DispatchDecisionEngine:
         if replan_unfinished is None:
             replan_unfinished = self.solver.should_replan_unfinished()
 
+        if self.solver_name == "ga_mmce":
+            return self._execute_ga_incremental_with_admission(
+                new_orders,
+                current_time,
+                bbox,
+                scene_id=scene_id,
+            )
+
         if replan_unfinished:
             return self._execute_replan_unfinished(
                 new_orders,
@@ -275,6 +295,481 @@ class DispatchDecisionEngine:
             self._log_detailed_route(route, plan.allocations)
 
         return plan
+
+    def retry_ga_pending_orders(
+        self,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan | None:
+        """周期性把 GA-MMCE 延迟/遗留 pending 订单重新纳入调度。"""
+        if self.solver_name != "ga_mmce":
+            return None
+
+        pending = dict(self.order_mgr.pending_orders)
+        if not pending:
+            self._ga_admission_delayed_ids.clear()
+            self._ga_delayed_order_first_seen.clear()
+            self._ga_delayed_order_last_retry.clear()
+            return None
+
+        for oid in list(self._ga_admission_delayed_ids):
+            if oid not in pending:
+                self._ga_admission_delayed_ids.discard(oid)
+        for oid in list(self._ga_delayed_order_first_seen):
+            if oid not in pending:
+                self._ga_delayed_order_first_seen.pop(oid, None)
+                self._ga_delayed_order_last_retry.pop(oid, None)
+        for oid in pending:
+            self._ga_delayed_order_first_seen.setdefault(oid, current_time)
+
+        urgent_due = [
+            oid for oid, order in pending.items()
+            if self._is_ga_order_deadline_tight(order, current_time)
+            and current_time - self._ga_delayed_order_last_retry.get(oid, -1e9)
+            >= self._ga_pending_retry_min_interval_s
+        ]
+        interval_due = (
+            current_time - self._ga_last_pending_replan_time
+            >= self._ga_pending_replan_interval_s
+        )
+        if not urgent_due and not interval_due:
+            return None
+
+        selected = self._select_ga_pending_replan_orders(pending, current_time)
+        if not selected:
+            return None
+
+        self._ga_last_pending_replan_time = current_time
+        for oid in selected:
+            self._ga_delayed_order_last_retry[oid] = current_time
+
+        logger.info(
+            "[DispatchDecisionEngine] GA-MMCE pending 周期重规划: %d/%d 单 %s",
+            len(selected),
+            len(pending),
+            selected,
+        )
+        return self._execute_ga_pending_retry_batch(
+            {oid: pending[oid] for oid in selected if oid in pending},
+            current_time,
+            bbox,
+            scene_id=scene_id,
+        )
+
+    def _execute_ga_incremental_with_admission(
+        self,
+        new_orders: dict,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        """GA-MMCE 新单准入：近仓直飞、近车急单直派，其余留 pending 合批。"""
+        immediate_plan = self._build_ga_direct_admission_plan(
+            new_orders,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+            dispatch_type="ga_dynamic_admission",
+        )
+        immediate_ids = {
+            alloc.order_id
+            for alloc in immediate_plan.allocations
+            if alloc.feasible
+        }
+        delayed_ids = [oid for oid in new_orders if oid not in immediate_ids]
+        for oid in delayed_ids:
+            self._ga_admission_delayed_ids.add(oid)
+            self._ga_delayed_order_first_seen.setdefault(oid, current_time)
+            self._ga_delayed_order_last_retry.setdefault(oid, -1e9)
+        if delayed_ids:
+            # 新单进入延迟池时重置合批窗口，避免下一帧被周期入口立刻重规划。
+            self._ga_last_pending_replan_time = current_time
+
+        if immediate_plan.allocations:
+            self._finalize_and_apply_ga_direct_plan(immediate_plan, current_time)
+
+        immediate_plan.summary.update(
+            {
+                "admitted_direct_order_ids": sorted(immediate_ids),
+                "delayed_pending_order_ids": sorted(delayed_ids),
+                "new_orders": len(new_orders),
+            }
+        )
+        if delayed_ids:
+            logger.info(
+                "[DispatchDecisionEngine] GA-MMCE 新单延迟合批: %d 单保持 pending %s",
+                len(delayed_ids),
+                sorted(delayed_ids),
+            )
+        return immediate_plan
+
+    def _execute_ga_pending_retry_batch(
+        self,
+        retry_orders: dict,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        direct_plan = self._build_ga_direct_admission_plan(
+            retry_orders,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+            dispatch_type="ga_pending_direct_retry",
+        )
+        direct_ids = {
+            alloc.order_id
+            for alloc in direct_plan.allocations
+            if alloc.feasible
+        }
+        if direct_plan.allocations:
+            self._finalize_and_apply_ga_direct_plan(direct_plan, current_time)
+
+        ga_orders = {
+            oid: order
+            for oid, order in retry_orders.items()
+            if oid not in direct_ids and oid in self.order_mgr.pending_orders
+        }
+        if not ga_orders:
+            direct_plan.summary["pending_retry_ga_orders"] = 0
+            return direct_plan
+
+        plan = self._execute_replan_unfinished(
+            ga_orders,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+        )
+        for alloc in plan.allocations:
+            if getattr(alloc, "feasible", False):
+                self._ga_admission_delayed_ids.discard(alloc.order_id)
+                self._ga_delayed_order_first_seen.pop(alloc.order_id, None)
+                self._ga_delayed_order_last_retry.pop(alloc.order_id, None)
+        return plan
+
+    def _finalize_and_apply_ga_direct_plan(self, plan: DispatchPlan, current_time: float) -> None:
+        plan.summary["solver"] = self.solver_name
+        self._normalize_plan_for_runtime(plan)
+        self._accumulate_plan_metrics(plan)
+        self._apply_plan(plan, current_time, incremental=True)
+        self._build_drone_routes(plan, current_time)
+        for alloc in plan.allocations:
+            if getattr(alloc, "feasible", False):
+                self._ga_admission_delayed_ids.discard(alloc.order_id)
+                self._ga_delayed_order_first_seen.pop(alloc.order_id, None)
+                self._ga_delayed_order_last_retry.pop(alloc.order_id, None)
+
+    def _build_ga_direct_admission_plan(
+        self,
+        orders: dict,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None,
+        dispatch_type: str,
+    ) -> DispatchPlan:
+        from solver.greedy_mmce import AllocationResult, DispatchPlan
+
+        self._activate_path_planner(scene_id)
+        self._warm_greedy_distance_cache(bbox, scene_id)
+
+        allocations: list[AllocationResult] = []
+        remaining: dict[str, object] = dict(orders)
+        used_drones: set[str] = set()
+
+        for oid, order in sorted(
+            list(remaining.items()),
+            key=lambda item: (
+                self._safe_float(getattr(item[1], "deadline", math.inf), math.inf),
+                str(item[0]),
+            ),
+        ):
+            alloc = self._try_ga_depot_direct_allocation(
+                oid,
+                order,
+                current_time,
+                used_drones,
+            )
+            if alloc is None:
+                continue
+            allocations.append(alloc)
+            used_drones.add(alloc.drone_id)
+            remaining.pop(oid, None)
+
+        truck_allocs, truck_routes = self._build_ga_near_truck_direct_allocations(
+            remaining,
+            current_time,
+        )
+        allocations.extend(truck_allocs)
+
+        modes: dict[str, int] = {}
+        for alloc in allocations:
+            if alloc.feasible:
+                modes[alloc.mode] = modes.get(alloc.mode, 0) + 1
+        return DispatchPlan(
+            allocations=allocations,
+            cost_total=sum(float(getattr(a, "score_total", 0.0) or 0.0) for a in allocations),
+            summary={
+                "total_orders": len(orders),
+                "feasible": sum(1 for a in allocations if a.feasible),
+                "modes": modes,
+                "dispatch_type": dispatch_type,
+                "solver": "ga_mmce",
+                "ga_partial_plan": True,
+            },
+            truck_routes=truck_routes,
+            drone_routes={},
+        )
+
+    def _try_ga_depot_direct_allocation(
+        self,
+        order_id: str,
+        order,
+        current_time: float,
+        used_drones: set[str],
+    ):
+        from core.entities.primitives import DroneStatus
+        from solver.greedy_mmce import AllocationResult
+
+        helper = getattr(self.solver, "greedy_helper", None)
+        if helper is None:
+            return None
+
+        best: tuple[float, object, object, float, float] | None = None
+        for depot in self.entity_mgr.depots.values():
+            depot_dist = self._distance_2d(depot.location, order.delivery_loc)
+            if depot_dist > self._ga_depot_direct_radius_m:
+                continue
+            for drone_id in list(getattr(depot, "idle_drones", []) or []):
+                if drone_id in used_drones:
+                    continue
+                drone = self.entity_mgr.drones.get(drone_id)
+                if drone is None or drone.status != DroneStatus.IDLE:
+                    continue
+                if getattr(drone, "transport_truck_id", None):
+                    continue
+                if getattr(drone, "carrying_order_id", None) or getattr(drone, "has_pending_route", False):
+                    continue
+                if drone.current_loc.distance_2d(depot.location) > getattr(helper, "DEPOT_LAUNCH_TOLERANCE_M", 30.0):
+                    continue
+                payload = float(getattr(order, "payload_weight", 0.0) or 0.0)
+                if payload > float(getattr(drone, "payload_capacity", 0.0) or 0.0):
+                    continue
+
+                out_dist = helper._uav_path_distance(depot.location, order.delivery_loc, altitude=helper.UAV_CRUISE_ALTITUDE_M)
+                back_dist = helper._uav_path_distance(order.delivery_loc, depot.location, altitude=helper.UAV_CRUISE_ALTITUDE_M)
+                energy_need = (
+                    helper._flight_energy(drone, depot.location, order.delivery_loc, payload)
+                    + helper._flight_energy(drone, order.delivery_loc, depot.location, 0.0)
+                ) * float(getattr(helper, "ENERGY_SAFETY_FACTOR", 1.0) or 1.0)
+                safe_margin = float(getattr(drone, "safe_margin_j", 0.0) or 0.0)
+                if energy_need + safe_margin > float(getattr(drone, "battery_current", 0.0) or 0.0):
+                    continue
+
+                completion = (
+                    current_time
+                    + out_dist / max(1e-6, float(getattr(drone, "cruise_speed", 0.0) or 0.0))
+                    + float(getattr(helper, "delivery_service_time", 30.0) or 30.0)
+                )
+                if completion > float(getattr(order, "deadline", math.inf)) + self._ga_direct_deadline_grace_s:
+                    continue
+
+                total_dist = out_dist + back_dist
+                score = (
+                    total_dist * 0.015
+                    + helper._uav_energy_wh(drone, depot.location, order.delivery_loc, payload) * 0.02
+                    + helper._uav_energy_wh(drone, order.delivery_loc, depot.location, 0.0) * 0.02
+                )
+                item = (score, depot, drone, total_dist, completion)
+                if best is None or item[0] < best[0]:
+                    best = item
+
+        if best is None:
+            return None
+
+        score, depot, drone, total_dist, completion = best
+        logger.info(
+            "[DispatchDecisionEngine] GA-MMCE 新单近仓直飞: order=%s depot=%s drone=%s dist=%.1fm completion=%.1f",
+            order_id,
+            depot.depot_id,
+            drone.drone_id,
+            total_dist,
+            completion,
+        )
+        return AllocationResult(
+            order_id=order_id,
+            vehicle_id=depot.depot_id,
+            mode="C",
+            distance=total_dist,
+            feasible=True,
+            recovery_station_id=depot.depot_id,
+            drone_id=drone.drone_id,
+            launch_station_id=depot.depot_id,
+            score_total=score,
+            cost_dist=total_dist * 0.015,
+        )
+
+    def _build_ga_near_truck_direct_allocations(
+        self,
+        orders: dict,
+        current_time: float,
+    ) -> tuple[list, dict]:
+        from solver.greedy_mmce import AllocationResult
+
+        helper = getattr(self.solver, "greedy_helper", None)
+        if helper is None or not orders:
+            return [], {}
+
+        truck_state: dict[str, dict] = {
+            tid: {
+                "truck": truck,
+                "pos": truck.get_location(current_time),
+                "time": current_time,
+                "stops": [],
+            }
+            for tid, truck in self.entity_mgr.trucks.items()
+        }
+        allocations: list[AllocationResult] = []
+
+        for oid, order in sorted(
+            orders.items(),
+            key=lambda item: (
+                self._safe_float(getattr(item[1], "deadline", math.inf), math.inf),
+                self._nearest_truck_distance(item[1], current_time),
+                str(item[0]),
+            ),
+        ):
+            if not self._is_ga_order_deadline_tight(order, current_time):
+                continue
+
+            best: tuple[float, str, float, float, float] | None = None
+            for tid, state in truck_state.items():
+                truck = state["truck"]
+                dist = helper._road_dist(state["pos"], order.delivery_loc)
+                if dist > self._ga_truck_direct_radius_m:
+                    continue
+                arrival = state["time"] + dist / max(1e-6, float(getattr(truck, "speed", 0.0) or 0.0))
+                completion = arrival + self.TRUCK_SERVICE_TIME_ORDER
+                if completion > float(getattr(order, "deadline", math.inf)) + self._ga_direct_deadline_grace_s:
+                    continue
+                score = dist * 0.08 + helper._truck_energy_wh(dist) * 0.02
+                item = (score, tid, dist, arrival, completion)
+                if best is None or item[0] < best[0]:
+                    best = item
+
+            if best is None:
+                continue
+
+            score, tid, dist, arrival, completion = best
+            state = truck_state[tid]
+            state["stops"].append({
+                "node_id": oid,
+                "node_type": "customer",
+                "position": order.delivery_loc,
+                "arrival_time": arrival,
+                "departure_time": completion,
+                "order_id": oid,
+                "action": "deliver",
+            })
+            state["pos"] = order.delivery_loc
+            state["time"] = completion
+            allocations.append(
+                AllocationResult(
+                    order_id=oid,
+                    vehicle_id=tid,
+                    mode="A",
+                    distance=dist,
+                    feasible=True,
+                    score_total=score,
+                    cost_dist=dist * 0.08,
+                    cost_energy=helper._truck_energy_wh(dist) * 0.02,
+                )
+            )
+            logger.info(
+                "[DispatchDecisionEngine] GA-MMCE 急单近车直派: order=%s truck=%s dist=%.1fm completion=%.1f",
+                oid,
+                tid,
+                dist,
+                completion,
+            )
+
+        routes = {}
+        for tid, state in truck_state.items():
+            if not state["stops"]:
+                continue
+            route = self._build_route_from_ordered_stops(
+                state["truck"],
+                state["stops"],
+                current_time,
+            )
+            if route is not None:
+                routes[tid] = route
+        return allocations, routes
+
+    def _select_ga_pending_replan_orders(self, pending: dict, current_time: float) -> list[str]:
+        def sort_key(item: tuple[str, object]) -> tuple[int, float, float, str]:
+            oid, order = item
+            delayed_rank = 0 if oid in self._ga_admission_delayed_ids else 1
+            deadline = self._safe_float(getattr(order, "deadline", math.inf), math.inf)
+            return (
+                delayed_rank,
+                deadline - current_time,
+                self._nearest_truck_distance(order, current_time),
+                oid,
+            )
+
+        eligible = [
+            (oid, order)
+            for oid, order in pending.items()
+            if current_time - self._ga_delayed_order_last_retry.get(oid, -1e9)
+            >= self._ga_pending_retry_min_interval_s
+        ]
+        return [
+            oid for oid, _ in sorted(eligible, key=sort_key)[: self._ga_pending_replan_batch_size]
+        ]
+
+    def _is_ga_order_deadline_tight(self, order, current_time: float) -> bool:
+        deadline = self._safe_float(getattr(order, "deadline", math.inf), math.inf)
+        return deadline - current_time <= self._ga_urgent_deadline_slack_s
+
+    def _nearest_truck_distance(self, order, current_time: float) -> float:
+        if not self.entity_mgr.trucks:
+            return math.inf
+        pos = getattr(order, "delivery_loc", None)
+        if pos is None:
+            return math.inf
+        return min(
+            truck.get_location(current_time).distance_2d(pos)
+            for truck in self.entity_mgr.trucks.values()
+        )
+
+    @staticmethod
+    def _distance_2d(pos_a, pos_b) -> float:
+        if hasattr(pos_a, "distance_2d"):
+            return float(pos_a.distance_2d(pos_b))
+        dx = float(pos_a.x) - float(pos_b.x)
+        dy = float(pos_a.y) - float(pos_b.y)
+        return math.sqrt(dx * dx + dy * dy)
+
+    @staticmethod
+    def _safe_float(value, default: float) -> float:
+        try:
+            result = float(value if value is not None else default)
+            return result if math.isfinite(result) else default
+        except (TypeError, ValueError):
+            return default
+
+    def _warm_greedy_distance_cache(self, bbox: dict, scene_id: str | None) -> None:
+        helper = getattr(self.solver, "greedy_helper", None)
+        if helper is None or not bbox:
+            return
+        try:
+            helper._road_distance_memo.clear()
+            helper._uav_path_distance_memo.clear()
+            helper._activate_path_planner(scene_id)
+            helper._load_road_graph(bbox, scene_id)
+        except Exception:
+            logger.debug("[DispatchDecisionEngine] GA direct admission distance cache warmup failed", exc_info=True)
 
     def _execute_replan_unfinished(
         self,
@@ -766,7 +1261,7 @@ class DispatchDecisionEngine:
             truck._planned_route_stops = existing_stops[:cursor] + refreshed_future
             # 重新构建物理路由，保证旧停靠点不丢失
             try:
-                rebuilt_route = self.solver.build_incremental_route_from_stops(
+                rebuilt_route = self._build_route_from_ordered_stops(
                     truck,
                     refreshed_future,
                     current_time,
@@ -907,19 +1402,11 @@ class DispatchDecisionEngine:
             cur_pos = stop_pos
             cur_time = departure
 
-        rebuilt_route = None
-        try:
-            rebuilt_route = self.solver.build_incremental_route_from_stops(
-                truck,
-                retimed_future,
-                current_time,
-            )
-        except Exception as e:
-            logger.exception(
-                "[DispatchDecisionEngine] OSM 后缀路线重建失败 %s: %s",
-                truck.truck_id,
-                e,
-            )
+        rebuilt_route = self._build_route_from_ordered_stops(
+            truck,
+            retimed_future,
+            current_time,
+        )
 
         if rebuilt_route is not None and len(rebuilt_route.nodes) >= 2:
             rebuilt_stops = [
@@ -950,7 +1437,7 @@ class DispatchDecisionEngine:
                     e,
                 )
         else:
-            # 兜底：若 OSM 后缀重建失败，保留旧计划避免不可达停靠阻塞后续事件游标。
+            # 理论上 _build_route_from_ordered_stops 已提供直线路径兜底；这里保留最后防线。
             logger.warning(
                 "[DispatchDecisionEngine] 增量模式卡车 %s 后缀重建失败，保留旧计划（不写入新停靠）",
                 truck.truck_id,
@@ -964,6 +1451,81 @@ class DispatchDecisionEngine:
             "(cursor=%d, 总计 %d 停靠)",
             len(new_stops), truck.truck_id, cursor, len(truck._planned_route_stops),
         )
+
+    def _build_route_from_ordered_stops(
+        self,
+        truck,
+        ordered_stops: list[dict],
+        current_time: float,
+    ):
+        """按给定停靠顺序构建卡车后缀路线，OSM 不可用时回退直线路径。"""
+        try:
+            rebuilt = self.solver.build_incremental_route_from_stops(
+                truck,
+                ordered_stops,
+                current_time,
+            )
+            if rebuilt is not None and len(getattr(rebuilt, "nodes", []) or []) >= 2:
+                return rebuilt
+        except Exception:
+            logger.debug(
+                "[DispatchDecisionEngine] build_incremental_route_from_stops failed, fallback direct",
+                exc_info=True,
+            )
+
+        from solver.greedy_mmce import TruckRoute, TruckRouteNode
+
+        route = TruckRoute(truck_id=truck.truck_id)
+        cur_pos = truck.get_location(current_time)
+        cur_time = current_time
+        route.nodes.append(
+            TruckRouteNode(
+                node_id=f"{truck.truck_id}_origin",
+                node_type="origin",
+                position=cur_pos,
+                arrival_time=current_time,
+                departure_time=current_time,
+            )
+        )
+        route.geometry.append(cur_pos)
+        speed = max(1e-6, float(getattr(truck, "speed", 0.0) or 0.0))
+        total_dist = 0.0
+        helper = getattr(self.solver, "greedy_helper", None)
+
+        for stop in ordered_stops:
+            stop_pos = stop.get("position")
+            if stop_pos is None:
+                continue
+            if helper is not None:
+                dist = helper._road_dist(cur_pos, stop_pos)
+            else:
+                dist = cur_pos.distance_2d(stop_pos)
+            arrival = cur_time + dist / speed
+            prev_arrival = float(stop.get("arrival_time", arrival) or arrival)
+            prev_departure = float(stop.get("departure_time", prev_arrival) or prev_arrival)
+            service_time = max(0.0, prev_departure - prev_arrival)
+            departure = arrival + service_time
+            node = TruckRouteNode(
+                node_id=str(stop.get("node_id", "")),
+                node_type=str(stop.get("node_type", "")),
+                position=stop_pos,
+                arrival_time=arrival,
+                departure_time=departure,
+                order_id=str(stop.get("order_id", "")),
+            )
+            action = str(stop.get("action", "") or "")
+            if action:
+                setattr(node, "action", action)
+            route.nodes.append(node)
+            route.geometry.append(stop_pos)
+            if node.node_type == "station":
+                route.charging_stop_ids.append(node.node_id)
+            total_dist += dist
+            cur_pos = stop_pos
+            cur_time = departure
+
+        route.total_distance = total_dist
+        return route if len(route.nodes) >= 2 else None
 
     def _sync_waiting_drone_launch_times_for_truck(self, truck, current_time: float) -> None:
         """将车上等待起飞无人机的 launch_time 对齐到卡车当前时刻表。"""

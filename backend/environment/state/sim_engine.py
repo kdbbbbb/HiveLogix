@@ -266,6 +266,7 @@ class SimulationEngine:
                 self._first_pending_incremental_sim_time = self.current_time
 
         if not self._pending_incremental_ids:
+            self._try_ga_pending_periodic_replan()
             return
 
         # 防抖：若新订单仍在连续到达，先短暂合批；但不超过最长等待上限。
@@ -314,6 +315,35 @@ class SimulationEngine:
         except Exception:
             logger.exception("[SimEngine] 动态订单增量调度失败")
             # 失败后同样设置最小重试间隔，避免每帧抛错导致卡顿。
+            self._last_incremental_dispatch_sim_time = self.current_time
+
+    def _try_ga_pending_periodic_replan(self) -> None:
+        """GA-MMCE 在没有新单触发时，周期性重试仍留在 pending 的订单。"""
+        if (
+            self._dispatch_engine is None
+            or self._order_mgr is None
+            or self._dispatch_bbox is None
+        ):
+            return
+        if str(getattr(self._dispatch_engine, "solver_name", "") or "").lower() != "ga_mmce":
+            return
+        if not self._order_mgr.pending_orders:
+            return
+        retry = getattr(self._dispatch_engine, "retry_ga_pending_orders", None)
+        if not callable(retry):
+            return
+        try:
+            plan = retry(
+                self.current_time,
+                self._dispatch_bbox,
+                scene_id=self._dispatch_scene_id,
+            )
+            if plan is None:
+                return
+            self._last_incremental_dispatch_sim_time = self.current_time
+            self._pending_snapshot = set(self._order_mgr.pending_orders.keys())
+        except Exception:
+            logger.exception("[SimEngine] GA-MMCE pending 周期重规划失败")
             self._last_incremental_dispatch_sim_time = self.current_time
 
     def _build_tick_payload(self) -> dict:
