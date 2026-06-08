@@ -1,0 +1,111 @@
+/* =================================================================
+   HiveLogix Design Tokens
+   全局 CSS 自定义属性——所有组件均从此文件取色 / 取值，
+   不得在组件内部硬编码颜色或尺寸常量。
+   ================================================================= */
+
+:root {
+  /* ── 品牌色 ────────────────────────────────────────────────── */
+  --hl-primary:        #2563eb;
+  --hl-primary-dark:   #1d4ed8;
+  --hl-primary-light:  #eff6ff;
+  --hl-primary-alpha:  rgba(37, 99, 235, 0.12);
+
+  /* ── 侧边导航栏 ─────────────────────────────────────────────── */
+  --hl-sidebar-w:             220px;
+  --hl-sidebar-bg:            #0f172a;
+  --hl-sidebar-border:        rgba(255, 255, 255, 0.07);
+  --hl-sidebar-logo-h:        64px;
+  --hl-sidebar-item-h:        44px;
+  --hl-sidebar-item-radius:   7px;
+  --hl-sidebar-item-gap:      3px;
+  --hl-sidebar-padding:       10px;
+
+  /* 导航文字 / 图标色 */
+  --hl-nav-text:         #94a3b8;
+  --hl-nav-text-active:  #ffffff;
+  --hl-nav-icon:         #64748b;
+  --hl-nav-icon-active:  #ffffff;
+  --hl-nav-hover-bg:     rgba(255, 255, 255, 0.07);
+  --hl-nav-active-bg:    #2563eb;
+
+  /* ── 内容区 ────────────────────────────────────────────────── */
+  --hl-content-bg:   #f1f5f9;
+  --hl-page-padding: 24px;
+
+  /* ── 卡片 ──────────────────────────────────────────────────── */
+  --hl-card-bg:      #ffffff;
+  --hl-card-radius:  10px;
+  --hl-card-border:  #e2e8f0;
+  --hl-card-shadow:  0 1px 3px rgba(0, 0, 0, 0.07),
+                     0 4px 12px rgba(0, 0, 0, 0.04);
+
+  /* ── 字体 ──────────────────────────────────────────────────── */
+  --hl-font:          "Inter", "Microsoft YaHei UI", "PingFang SC",
+                      "Helvetica Neue", sans-serif;
+  --hl-text:          #0f172a;
+  --hl-text-secondary:#475569;
+  --hl-text-muted:    #94a3b8;
+
+  /* ── 状态色 ────────────────────────────────────────────────── */
+  --hl-success:  #16a34a;
+  --hl-warning:  #d97706;
+  --hl-danger:   #dc2626;
+  --hl-info:     #0891b2;
+
+  --hl-success-light: #dcfce7;
+  --hl-warning-light: #fef3c7;
+  --hl-danger-light:  #fee2e2;
+  --hl-info-light:    #cffafe;
+
+  /* ── 边框 ──────────────────────────────────────────────────── */
+  --hl-border:        #e2e8f0;
+  --hl-border-radius: 8px;
+
+  /* ── 间距 ──────────────────────────────────────────────────── */
+  --hl-space-xs:  4px;
+  --hl-space-sm:  8px;
+  --hl-space-md:  16px;
+  --hl-space-lg:  24px;
+  --hl-space-xl:  32px;
+  --hl-space-2xl: 48px;
+
+  /* ── 阴影 ──────────────────────────────────────────────────── */
+  --hl-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --hl-shadow:    0 1px 3px rgba(0, 0, 0, 0.1),
+                  0 1px 2px rgba(0, 0, 0, 0.06);
+  --hl-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07),
+                  0 2px 4px rgba(0, 0, 0, 0.06);
+  --hl-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1),
+                  0 4px 6px rgba(0, 0, 0, 0.05);
+
+  /* ── 过渡 ──────────────────────────────────────────────────── */
+  --hl-transition: 0.15s ease;
+}
+
+/* ── 全局基础重置 ────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  width: 100%;
+  font-family: var(--hl-font);
+  font-size: 14px;
+  color: var(--hl-text);
+  background: var(--hl-content-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── 通用滚动条样式 ──────────────────────────────────────────────── */
+::-webkit-scrollbar               { width: 6px; height: 6px; }
+::-webkit-scrollbar-track         { background: transparent; }
+::-webkit-scrollbar-thumb         { background: #cbd5e1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover   { background: #94a3b8; }

@@ -1,0 +1,191 @@
+{
+  "depots": [
+    {
+      "altitude": 0,
+      "capacity": 500,
+      "depot_id": "DEP-TEST-01",
+      "lat": 31.056124,
+      "lng": 121.217426,
+      "name": "仓库-中心",
+      "parking_slots": 4,
+      "swap_time": 1
+    }
+  ],
+  "stations": [
+    {
+      "altitude": 0,
+      "lat": 31.031562,
+      "lng": 121.199187,
+      "name": "充电站-01",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-01",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.038229,
+      "lng": 121.217305,
+      "name": "充电站-02",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-02",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.041114,
+      "lng": 121.228165,
+      "name": "充电站-03",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-03",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.034553,
+      "lng": 121.230891,
+      "name": "充电站-04",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-04",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.044772,
+      "lng": 121.216943,
+      "name": "充电站-05",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-05",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.041077,
+      "lng": 121.202052,
+      "name": "充电站-06",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-06",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.054402,
+      "lng": 121.227908,
+      "name": "充电站-07",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-07",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.026717,
+      "lng": 121.219475,
+      "name": "充电站-08",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-08",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.030275,
+      "lng": 121.213167,
+      "name": "充电站-09",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-09",
+      "swap_time": 1
+    },
+    {
+      "altitude": 0,
+      "lat": 31.053366,
+      "lng": 121.202426,
+      "name": "充电站-10",
+      "parking_slots": 1,
+      "station_id": "STA-TEST-10",
+      "swap_time": 1
+    }
+  ],
+  "trucks": [
+    {
+      "home_depot_id": "DEP-TEST-01",
+      "max_inventory": 30,
+      "name": "卡车-01",
+      "parking_slots": 3,
+      "speed": 13.0,
+      "swap_time": 1,
+      "truck_id": "TRK-TEST-01"
+    }
+  ],
+  "drones": [
+    {
+      "drone_id": "UAV-TEST-01",
+      "drone_type": "LightDrone",
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
+    },
+    {
+      "drone_id": "UAV-TEST-02",
+      "drone_type": "LightDrone",
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
+    },
+    {
+      "drone_id": "UAV-TEST-03",
+      "drone_type": "LightDrone",
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
+    },
+    {
+      "drone_id": "UAV-TEST-04",
+      "drone_type": "LightDrone",
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
+    },
+    {
+      "drone_id": "UAV-TEST-05",
+      "drone_type": "LightDrone",
+      "home_id": "DEP-TEST-01",
+      "home_type": "DEPOT"
+    },
+    {
+      "drone_id": "UAV-TEST-06",
+      "drone_type": "LightDrone",
+      "home_id": "DEP-TEST-01",
+      "home_type": "DEPOT"
+    },
+    {
+      "drone_id": "UAV-TEST-07",
+      "drone_type": "LightDrone",
+      "home_id": "DEP-TEST-01",
+      "home_type": "DEPOT"
+    },
+    {
+      "drone_id": "UAV-TEST-08",
+      "drone_type": "LightDrone",
+      "home_id": "DEP-TEST-01",
+      "home_type": "DEPOT"
+    },
+    {
+      "drone_id": "UAV-TEST-09",
+      "drone_type": "HeavyDrone",
+      "home_id": "DEP-TEST-01",
+      "home_type": "DEPOT"
+    },
+    {
+      "drone_id": "UAV-TEST-10",
+      "drone_type": "HeavyDrone",
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
+    },
+    {
+      "drone_id": "UAV-TEST-11",
+      "drone_type": "HeavyDrone",
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
+    },
+    {
+      "drone_id": "UAV-TEST-12",
+      "drone_type": "HeavyDrone",
+      "home_id": "DEP-TEST-01",
+      "home_type": "DEPOT"
+    }
+  ]
+}

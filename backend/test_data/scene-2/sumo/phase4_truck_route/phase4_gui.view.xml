@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<viewsettings>
+    <scheme name="phase4_debug">
+        <vehicles vehicleName_show="1" vehicleName_size="80.00" vehicleName_color="0,220,255" vehicleName_bgColor="180,0,0,0" vehicleName_constantSize="1" vehicleName_onlySelected="0"/>
+        <pois poiTextParam="PARAM_TEXT" poi_minSize="0.00" poi_exaggeration="1.00" poi_constantSize="0" poiDetail="16" poiName_show="0" poiText_show="1" poiText_size="95.00" poiText_color="255,255,255" poiText_bgColor="190,0,0,0" poiText_constantSize="1" poiText_onlySelected="0"/>
+        <polys poly_minSize="0.00" poly_exaggeration="1.00" poly_constantSize="0" polyName_show="0" polyType_show="0"/>
+    </scheme>
+    <delay value="250"/>
+</viewsettings>

@@ -1,0 +1,11 @@
+{
+  "truck_backbone_route": [
+    "STA-TEST-10",
+    "STA-TEST-09",
+    "STA-TEST-04",
+    "STA-TEST-08",
+    "STA-TEST-06",
+    "DEP-TEST-01"
+  ],
+  "truck_id": "TRK-TEST-01"
+}

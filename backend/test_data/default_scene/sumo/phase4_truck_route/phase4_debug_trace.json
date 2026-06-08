@@ -1,0 +1,539 @@
+{
+  "execution_stop_trace": [
+    {
+      "arrival_time_sec": 0.0,
+      "departure_time_sec": 0.0,
+      "nearest_osm_node_id": "13340772659",
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 0,
+      "snap_distance_m": 13.66971
+    },
+    {
+      "arrival_time_sec": 202.65605,
+      "departure_time_sec": 212.65605,
+      "nearest_osm_node_id": "3604582214",
+      "node_id": "STA-TEST-10",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 1,
+      "snap_distance_m": 10.897146
+    },
+    {
+      "arrival_time_sec": 306.837838,
+      "departure_time_sec": 336.837838,
+      "nearest_osm_node_id": "11770830110",
+      "node_id": "ORD-STATIC-08",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-08",
+      "seq": 2,
+      "snap_distance_m": 0.0
+    },
+    {
+      "arrival_time_sec": 432.721575,
+      "departure_time_sec": 442.721575,
+      "nearest_osm_node_id": "13340775855",
+      "node_id": "STA-TEST-06",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 3,
+      "snap_distance_m": 18.99683
+    },
+    {
+      "arrival_time_sec": 775.341715,
+      "departure_time_sec": 785.341715,
+      "nearest_osm_node_id": "11361814526",
+      "node_id": "STA-TEST-05",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 4,
+      "snap_distance_m": 16.965439
+    },
+    {
+      "arrival_time_sec": 855.269251,
+      "departure_time_sec": 865.269251,
+      "nearest_osm_node_id": "11393537553",
+      "node_id": "STA-TEST-02",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 5,
+      "snap_distance_m": 38.853532
+    },
+    {
+      "arrival_time_sec": 937.429351,
+      "departure_time_sec": 967.429351,
+      "nearest_osm_node_id": "7113128125",
+      "node_id": "ORD-STATIC-02",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-02",
+      "seq": 6,
+      "snap_distance_m": 0.0
+    },
+    {
+      "arrival_time_sec": 1118.002325,
+      "departure_time_sec": 1148.002325,
+      "nearest_osm_node_id": "11459214575",
+      "node_id": "ORD-STATIC-06",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-06",
+      "seq": 7,
+      "snap_distance_m": 0.0
+    },
+    {
+      "arrival_time_sec": 1280.75908,
+      "departure_time_sec": 1290.75908,
+      "nearest_osm_node_id": "1601488743",
+      "node_id": "STA-TEST-09",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 8,
+      "snap_distance_m": 16.131889
+    },
+    {
+      "arrival_time_sec": 1355.891183,
+      "departure_time_sec": 1385.891183,
+      "nearest_osm_node_id": "7743084366",
+      "node_id": "ORD-STATIC-07",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-07",
+      "seq": 9,
+      "snap_distance_m": 0.0
+    },
+    {
+      "arrival_time_sec": 1587.597874,
+      "departure_time_sec": 1617.597874,
+      "nearest_osm_node_id": "9311825206",
+      "node_id": "TRUCKONLY-20260424-01",
+      "node_type": "customer",
+      "order_id": "TRUCKONLY-20260424-01",
+      "seq": 10,
+      "snap_distance_m": 0.0
+    },
+    {
+      "arrival_time_sec": 1775.449043,
+      "departure_time_sec": 1805.449043,
+      "nearest_osm_node_id": "5860240815",
+      "node_id": "TRUCKONLY-20260424-02",
+      "node_type": "customer",
+      "order_id": "TRUCKONLY-20260424-02",
+      "seq": 11,
+      "snap_distance_m": 0.0
+    },
+    {
+      "arrival_time_sec": 1987.565903,
+      "departure_time_sec": 1987.565903,
+      "nearest_osm_node_id": "13340772659",
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 12,
+      "snap_distance_m": 13.66971
+    }
+  ],
+  "final_execution_plan": [
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 0,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    },
+    {
+      "node_id": "STA-TEST-10",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 1,
+      "x": 328475.068482,
+      "y": 3436904.483494
+    },
+    {
+      "node_id": "ORD-STATIC-08",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-08",
+      "seq": 2,
+      "x": 327917.689204,
+      "y": 3436177.515057
+    },
+    {
+      "node_id": "STA-TEST-06",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 3,
+      "x": 328417.321566,
+      "y": 3435542.805328
+    },
+    {
+      "node_id": "STA-TEST-05",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 4,
+      "x": 329845.199643,
+      "y": 3435929.489668
+    },
+    {
+      "node_id": "STA-TEST-02",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 5,
+      "x": 329868.109481,
+      "y": 3435203.636057
+    },
+    {
+      "node_id": "ORD-STATIC-02",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-02",
+      "seq": 6,
+      "x": 329972.866402,
+      "y": 3434382.722264
+    },
+    {
+      "node_id": "ORD-STATIC-06",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-06",
+      "seq": 7,
+      "x": 331145.989213,
+      "y": 3434348.676887
+    },
+    {
+      "node_id": "STA-TEST-09",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 8,
+      "x": 329458.957408,
+      "y": 3434328.271882
+    },
+    {
+      "node_id": "ORD-STATIC-07",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-07",
+      "seq": 9,
+      "x": 328932.640943,
+      "y": 3433947.826008
+    },
+    {
+      "node_id": "TRUCKONLY-20260424-01",
+      "node_type": "customer",
+      "order_id": "TRUCKONLY-20260424-01",
+      "seq": 10,
+      "x": 329031.007024,
+      "y": 3436251.271845
+    },
+    {
+      "node_id": "TRUCKONLY-20260424-02",
+      "node_type": "customer",
+      "order_id": "TRUCKONLY-20260424-02",
+      "seq": 11,
+      "x": 329234.02654,
+      "y": 3435481.71693
+    },
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 12,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    }
+  ],
+  "initial_execution_plan": [
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 0,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    },
+    {
+      "node_id": "ORD-STATIC-08",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-08",
+      "seq": 1,
+      "x": 327917.689204,
+      "y": 3436177.515057
+    },
+    {
+      "node_id": "ORD-STATIC-02",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-02",
+      "seq": 2,
+      "x": 329972.866402,
+      "y": 3434382.722264
+    },
+    {
+      "node_id": "ORD-STATIC-06",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-06",
+      "seq": 3,
+      "x": 331145.989213,
+      "y": 3434348.676887
+    },
+    {
+      "node_id": "ORD-STATIC-07",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-07",
+      "seq": 4,
+      "x": 328932.640943,
+      "y": 3433947.826008
+    },
+    {
+      "node_id": "TRUCKONLY-20260424-01",
+      "node_type": "customer",
+      "order_id": "TRUCKONLY-20260424-01",
+      "seq": 5,
+      "x": 329031.007024,
+      "y": 3436251.271845
+    },
+    {
+      "node_id": "TRUCKONLY-20260424-02",
+      "node_type": "customer",
+      "order_id": "TRUCKONLY-20260424-02",
+      "seq": 6,
+      "x": 329234.02654,
+      "y": 3435481.71693
+    },
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 7,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    }
+  ],
+  "inserted_fixed_nodes": [
+    {
+      "adjusted_extra_time_sec": -118.65051274550292,
+      "detour_cost_road_m": -9.094947017729282e-13,
+      "extra_route_time_sec": -6.996113090560987e-14,
+      "insert_index": 2,
+      "mode_c_opportunity_bonus_sec": 118.65051274550285,
+      "node_id": "STA-TEST-02",
+      "node_type": "station",
+      "reason": "on_route",
+      "station_eta_sec": 504.7292935100039
+    },
+    {
+      "adjusted_extra_time_sec": 6.996113090560987e-14,
+      "detour_cost_road_m": 9.094947017729282e-13,
+      "extra_route_time_sec": 6.996113090560987e-14,
+      "insert_index": 5,
+      "mode_c_opportunity_bonus_sec": 0.0,
+      "node_id": "STA-TEST-09",
+      "node_type": "station",
+      "reason": "on_route",
+      "station_eta_sec": 925.9894747577133
+    },
+    {
+      "adjusted_extra_time_sec": -113.47384115976288,
+      "detour_cost_road_m": 504.41289361478357,
+      "extra_route_time_sec": 38.800991816521815,
+      "insert_index": 1,
+      "mode_c_opportunity_bonus_sec": 152.2748329762847,
+      "node_id": "STA-TEST-10",
+      "node_type": "station",
+      "reason": "station_target_count",
+      "station_eta_sec": 200.76629176096174
+    },
+    {
+      "adjusted_extra_time_sec": -85.25917322012079,
+      "detour_cost_road_m": 1209.3582016164878,
+      "extra_route_time_sec": 93.02755397049906,
+      "insert_index": 3,
+      "mode_c_opportunity_bonus_sec": 178.28672719061984,
+      "node_id": "STA-TEST-06",
+      "node_type": "station",
+      "reason": "station_target_count",
+      "station_eta_sec": 428.532280351941
+    },
+    {
+      "adjusted_extra_time_sec": -48.74377895545635,
+      "detour_cost_road_m": 2307.0062743024964,
+      "extra_route_time_sec": 177.46202110019203,
+      "insert_index": 4,
+      "mode_c_opportunity_bonus_sec": 226.20580005564838,
+      "node_id": "STA-TEST-05",
+      "node_type": "station",
+      "reason": "station_target_count",
+      "station_eta_sec": 768.386091902421
+    }
+  ],
+  "min_future_fixed_nodes": 3,
+  "mode_c_candidate_order_count": 96,
+  "mode_c_candidate_order_ids": [
+    "ORD-LOWPRESSURE-FASTFINISH-001",
+    "ORD-STATIC-01",
+    "ORD-STATIC-03",
+    "ORD-STATIC-04",
+    "ORD-STATIC-09",
+    "ORD-STATIC-05",
+    "ORD-98C051FD-7",
+    "ORD-STATIC-10",
+    "ORD-EA5DEA56-15",
+    "ORD-B030DF3D-5",
+    "ORD-5C566AAE-19",
+    "ORD-D08A32AB-1",
+    "ORD-9BD1F880-12",
+    "ORD-1A933420-16",
+    "ORD-43D9FCA0-4",
+    "ORD-60247FE4-11",
+    "ORD-EA3CAACA-13",
+    "ORD-C3700E18-2",
+    "ORD-5AD8F1CB-6",
+    "ORD-B52013F1-17",
+    "ORD-CA4C84B1-8",
+    "ORD-115929A7-3",
+    "ORD-8B103C37-9",
+    "ORD-F923F8F8-18",
+    "ORD-E484F83F-20",
+    "ORD-2E93EB29-10",
+    "ORD-F18196A7-14",
+    "ORD-LOWPRESSURE-FASTFINISH-002",
+    "ORD-LOWPRESSURE-FASTFINISH-003",
+    "ORD-LOWPRESSURE-FASTFINISH-004",
+    "ORD-LOWPRESSURE-FASTFINISH-005",
+    "ORD-LOWPRESSURE-FASTFINISH-006",
+    "ORD-LOWPRESSURE-FASTFINISH-007",
+    "ORD-LOWPRESSURE-FASTFINISH-008",
+    "ORD-LOWPRESSURE-FASTFINISH-009",
+    "ORD-LOWPRESSURE-FASTFINISH-010",
+    "ORD-LOWPRESSURE-FASTFINISH-011",
+    "ORD-LOWPRESSURE-FASTFINISH-012",
+    "ORD-LOWPRESSURE-FASTFINISH-013",
+    "ORD-LOWPRESSURE-FASTFINISH-014",
+    "ORD-LOWPRESSURE-FASTFINISH-015",
+    "ORD-LOWPRESSURE-FASTFINISH-016",
+    "ORD-LOWPRESSURE-FASTFINISH-017",
+    "ORD-LOWPRESSURE-FASTFINISH-018",
+    "ORD-LOWPRESSURE-FASTFINISH-019",
+    "ORD-LOWPRESSURE-FASTFINISH-020",
+    "ORD-LOWPRESSURE-FASTFINISH-021",
+    "ORD-LOWPRESSURE-FASTFINISH-022",
+    "ORD-LOWPRESSURE-FASTFINISH-023",
+    "ORD-LOWPRESSURE-FASTFINISH-024",
+    "ORD-LOWPRESSURE-FASTFINISH-025",
+    "ORD-LOWPRESSURE-FASTFINISH-026",
+    "ORD-LOWPRESSURE-FASTFINISH-027",
+    "ORD-LOWPRESSURE-FASTFINISH-028",
+    "ORD-LOWPRESSURE-FASTFINISH-029",
+    "ORD-LOWPRESSURE-FASTFINISH-030",
+    "ORD-LOWPRESSURE-FASTFINISH-031",
+    "ORD-LOWPRESSURE-FASTFINISH-032",
+    "ORD-LOWPRESSURE-FASTFINISH-033",
+    "ORD-LOWPRESSURE-FASTFINISH-034",
+    "ORD-LOWPRESSURE-FASTFINISH-035",
+    "ORD-LOWPRESSURE-FASTFINISH-036",
+    "ORD-LOWPRESSURE-FASTFINISH-037",
+    "ORD-LOWPRESSURE-FASTFINISH-038",
+    "ORD-LOWPRESSURE-FASTFINISH-039",
+    "ORD-LOWPRESSURE-FASTFINISH-040",
+    "ORD-LOWPRESSURE-FASTFINISH-041",
+    "ORD-LOWPRESSURE-FASTFINISH-042",
+    "ORD-LOWPRESSURE-FASTFINISH-043",
+    "ORD-LOWPRESSURE-FASTFINISH-044",
+    "ORD-LOWPRESSURE-FASTFINISH-045",
+    "ORD-LOWPRESSURE-FASTFINISH-046",
+    "ORD-LOWPRESSURE-FASTFINISH-047",
+    "ORD-LOWPRESSURE-FASTFINISH-048",
+    "ORD-LOWPRESSURE-FASTFINISH-049",
+    "ORD-LOWPRESSURE-FASTFINISH-050",
+    "ORD-LOWPRESSURE-FASTFINISH-051",
+    "ORD-LOWPRESSURE-FASTFINISH-052",
+    "ORD-LOWPRESSURE-FASTFINISH-053",
+    "ORD-LOWPRESSURE-FASTFINISH-054",
+    "ORD-LOWPRESSURE-FASTFINISH-055",
+    "ORD-LOWPRESSURE-FASTFINISH-056",
+    "ORD-LOWPRESSURE-FASTFINISH-057",
+    "ORD-LOWPRESSURE-FASTFINISH-058",
+    "ORD-LOWPRESSURE-FASTFINISH-059",
+    "ORD-LOWPRESSURE-FASTFINISH-060",
+    "ORD-LOWPRESSURE-FASTFINISH-061",
+    "ORD-LOWPRESSURE-FASTFINISH-062",
+    "ORD-LOWPRESSURE-FASTFINISH-063",
+    "ORD-LOWPRESSURE-FASTFINISH-064",
+    "ORD-LOWPRESSURE-FASTFINISH-065",
+    "ORD-LOWPRESSURE-FASTFINISH-066",
+    "ORD-LOWPRESSURE-FASTFINISH-067",
+    "ORD-LOWPRESSURE-FASTFINISH-068",
+    "ORD-LOWPRESSURE-FASTFINISH-069",
+    "ORD-LOWPRESSURE-FASTFINISH-070"
+  ],
+  "ordered_truck_orders": [
+    {
+      "deadline": 2700.0,
+      "delivery_x": 327917.689204,
+      "delivery_y": 3436177.515057,
+      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
+      "order_id": "ORD-STATIC-08",
+      "seq": 0
+    },
+    {
+      "deadline": 4200.0,
+      "delivery_x": 329972.866402,
+      "delivery_y": 3434382.722264,
+      "fulfillment_mode": "DRONE_DIRECT",
+      "order_id": "ORD-STATIC-02",
+      "seq": 1
+    },
+    {
+      "deadline": 4200.0,
+      "delivery_x": 331145.989213,
+      "delivery_y": 3434348.676887,
+      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
+      "order_id": "ORD-STATIC-06",
+      "seq": 2
+    },
+    {
+      "deadline": 5400.0,
+      "delivery_x": 328932.640943,
+      "delivery_y": 3433947.826008,
+      "fulfillment_mode": "DRONE_DIRECT",
+      "order_id": "ORD-STATIC-07",
+      "seq": 3
+    },
+    {
+      "deadline": 10914.58909,
+      "delivery_x": 329031.007024,
+      "delivery_y": 3436251.271845,
+      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
+      "order_id": "TRUCKONLY-20260424-01",
+      "seq": 4
+    },
+    {
+      "deadline": 15292.524636,
+      "delivery_x": 329234.02654,
+      "delivery_y": 3435481.71693,
+      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
+      "order_id": "TRUCKONLY-20260424-02",
+      "seq": 5
+    }
+  ],
+  "station_target_count": 5,
+  "truck_id": "TRK-TEST-01",
+  "visited_fixed_node_ids": [
+    "DEP-TEST-01",
+    "STA-TEST-10",
+    "STA-TEST-06",
+    "STA-TEST-05",
+    "STA-TEST-02",
+    "STA-TEST-09",
+    "DEP-TEST-01"
+  ],
+  "visited_order_ids": [
+    "ORD-STATIC-08",
+    "ORD-STATIC-02",
+    "ORD-STATIC-06",
+    "ORD-STATIC-07",
+    "TRUCKONLY-20260424-01",
+    "TRUCKONLY-20260424-02"
+  ],
+  "visited_station_ids": [
+    "STA-TEST-10",
+    "STA-TEST-06",
+    "STA-TEST-05",
+    "STA-TEST-02",
+    "STA-TEST-09"
+  ]
+}

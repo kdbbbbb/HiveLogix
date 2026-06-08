@@ -1,0 +1,87 @@
+# HiveLogix — 无人机气动参数配置文件
+# =====================================================================
+# 物理模型说明（多旋翼功率方程）：
+#   P = k1 * (m_empty + payload)^1.5 + k2 * v^3
+#   其中:
+#     k1: 诱导功率系数    [W / kg^1.5]  — 由悬停功率方程标定
+#     k2: 废阻功率系数    [W / (m/s)^3] — 由风洞测试或文献确定
+#
+# 参数来源：
+#   - 轻型：对标美团 FP400 V4，公开最大速度 83km/h≈23.1m/s，仿真取 18m/s。
+#   - 重型：对标丰翼方舟 40，官方巡航速度 14m/s。
+#   - 电池容量为按本文件功率模型反推的等效电池能量，不是官方电池参数。
+# =====================================================================
+
+light_drone:
+  # 对标实物：美团 FP400 V4
+
+  # 气动/功耗参数
+  k1: 22.0          # W / kg^1.5
+                   # 功率模型参数
+  k2: 0.06          # W / (m/s)^3
+                   # 气动阻力相关参数
+
+  # 飞行性能
+  cruise_speed: 18.0           # m/s，美团公开最大速度约 23.1m/s，仿真中取保守巡航速度
+  payload_capacity: 2.5        # kg，最大任务载荷
+  empty_weight: 7.0            # kg，按最大起飞重量 - 最大载重近似，含机体、电池、货箱等
+
+  # 电池参数
+  battery_capacity_j: 1490400  # J，约 414Wh，按功率模型反推的等效电池能量
+  safe_margin_ratio: 0.10      # 保留 10% 电量作为安全余量
+
+
+heavy_drone:
+  # 对标实物：丰翼方舟 40
+
+  # 气动/功耗参数
+  k1: 22.0          # W / kg^1.5
+                   # 功率模型参数
+  k2: 0.06          # W / (m/s)^3
+                   # 气动阻力相关参数
+
+  # 飞行性能
+  cruise_speed: 14.0           # m/s，丰翼方舟 40 官方巡航速度
+  payload_capacity: 10.0       # kg，最大任务载荷
+  empty_weight: 36.0           # kg，按最大起飞重量 - 最大载重近似，含机体、电池、货箱等
+
+  # 电池参数
+  battery_capacity_j: 14230800 # J，约 3953Wh，按功率模型反推的等效电池能量
+  safe_margin_ratio: 0.10
+
+# 求解器统一评分参数（所有算法共享）
+# f = f_dist + f_energy + f_penalty
+solver_energy:
+  # 距离成本权重
+  c_dist_et: 1.0
+  c_dist_uav: 1.0
+
+  # 能耗成本权重
+  c_energy_et: 1.0
+  c_energy_uav: 1.0
+
+  # 时间惩罚权重
+  lambda_time: 10.0
+
+  # 能耗模型参数
+  # 卡车能耗: 0.75 kWh/km
+  truck_energy_kwh_per_km: 0.75
+  # 无人机评分能耗模型: physics(复用 drone.py 功率模型) / alpha(线性经验模型)
+  uav_energy_model: alpha
+  # 无人机能耗: alpha_k in Wh/(kg·km)
+  # 仅在 uav_energy_model=alpha 时生效
+  uav_alpha_wh_per_kg_km: 0.24
+
+  # 业务约束：是否允许无人机在运动中的卡车上直接起飞（模式B）
+  # false: 仅允许 B_WAIT（随车到站后起飞）
+  allow_moving_truck_launch: false
+
+  # 业务时长参数（所有算法共享）
+  # 卡车配送订单（到达客户点后的服务停留）
+  truck_service_time_order_s: 30
+  # 无人机配送订单（到达客户点后的服务停留）
+  drone_service_time_order_s: 30
+  # 卡车放飞无人机操作时长
+  truck_drone_launch_time_s: 10
+  # 卡车接回无人机操作时长
+  truck_drone_recover_time_s: 10

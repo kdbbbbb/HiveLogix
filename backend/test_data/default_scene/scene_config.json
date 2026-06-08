@@ -1,0 +1,38 @@
+{
+  "scene_id": "default_test_4x4km",
+  "name": "测试场景 - 4×4km (上海浦东)",
+  "description": "预加载的测试场景，包含真实 OSM 路网和建筑禁飞区",
+  "region": "shanghai_pudong",
+  "bounds": {
+    "min_lng": 121.195602,
+    "max_lng": 121.237661,
+    "min_lat": 31.023747,
+    "max_lat": 31.059783
+  },
+  "center": {
+    "lng": 121.216631,
+    "lat": 31.041765
+  },
+  "road_network": {
+    "source": "osm",
+    "file": "osm_network.geojson",
+    "bounds": {
+      "min_lng": 121.195602,
+      "max_lng": 121.237661,
+      "min_lat": 31.023747,
+      "max_lat": 31.059783
+    }
+  },
+  "sel_bounds": {
+    "minx": 3821000,
+    "miny": 534300,
+    "maxx": 3821400,
+    "maxy": 534600
+  },
+  "threshold": 80,
+  "height_column": "height",
+  "buildings_file": "buildings.geojson",
+  "entities_file": "entities.json",
+  "orders_file": "orders.json",
+  "height_threshold": 80
+}

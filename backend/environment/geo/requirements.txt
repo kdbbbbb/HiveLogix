@@ -1,0 +1,7 @@
+flask>=2.3.0
+flask-cors>=4.0.0
+geopandas>=0.14.0
+pandas>=2.0.0
+numpy>=1.24.0
+shapely>=2.0.0
+pyproj>=3.6.0
