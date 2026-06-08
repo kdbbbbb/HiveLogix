@@ -1,0 +1,63 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── 虚拟环境 ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── 原始地图数据（文件过大，不上传）──────────────────────
+shanghai_map/
+
+# ── 导出输出文件 ──────────────────────────────────────────
+output/
+backend/runs/
+
+# ── IDE / 编辑器 ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── 操作系统 ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 环境变量 ──────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Node.js / 前端 ───────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+frontend/.env.local
+*.tsbuildinfo
+
+# ── 日志 ─────────────────────────────────────────────────
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+backend/solver/market_debug_log*
+
+# ── misc ─────────────────────────────────────────────────
+*.bak
+*.tmp
+
+# ── 训练权重（不上传）──────────────────────────────────────
+backend/weights/rh_alns_cmrappo/
