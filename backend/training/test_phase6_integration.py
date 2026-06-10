@@ -110,6 +110,7 @@ class TestPhase6Integration(unittest.TestCase):
         return {
             "order_id": order_id,
             "order_feature": SimpleNamespace(
+                deadline=remaining_time,
                 remaining_time=remaining_time,
                 priority_band=priority_band,
             ),
@@ -1388,6 +1389,53 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(env._episode_done_reason(), "all_orders_cleared")
         self.assertTrue(env.is_done())
 
+    def test_benchmark_done_ignores_disabled_poisson_next_order_time(self) -> None:
+        scene_ctx = load_default_scene()
+        benchmark_source = build_order_source(
+            scene_ctx,
+            mode=OrderSourceMode.BENCHMARK,
+        )
+        env = TrainingEnvAdapter(
+            scene_ctx=scene_ctx,
+            order_source=benchmark_source,
+        )
+        env.reset()
+
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        order_mgr._next_order_time = 0.0
+        order_mgr._scheduled_dynamic = []
+        order_mgr._scheduled_dynamic_i = 0
+        env._background_mode_a_pending.clear()
+        env._reservations.clear()
+        env._flight_legs.clear()
+        env._delivery_service_legs.clear()
+        env._fallback_leg.clear()
+
+        self.assertEqual(env._episode_done_reason(), "all_orders_cleared")
+        self.assertTrue(env.is_done())
+
+    def test_benchmark_replay_max_orders_covers_all_scheduled_replay_orders(self) -> None:
+        scene_ctx = load_default_scene(
+            config_path="backend/config/rh_alns_cmrappo_bc_warm_start_three_stage_formal_30k_ddl_sorted.yaml"
+        )
+        benchmark_source = build_order_source(
+            scene_ctx,
+            mode=OrderSourceMode.BENCHMARK,
+            config_path="backend/config/rh_alns_cmrappo_bc_warm_start_three_stage_formal_30k_ddl_sorted.yaml",
+        )
+        replay_count = len(benchmark_source.initial_static_uav_orders) + len(
+            benchmark_source.scheduled_dynamic_orders
+        )
+
+        self.assertGreater(replay_count, 0)
+        self.assertGreaterEqual(
+            benchmark_source.poisson_gen_config.max_orders_per_episode,
+            replay_count,
+        )
+
     def test_recovery_only_truck_plan_skips_patrol_station_coverage(self) -> None:
         env, drone_id = self._reset_controlled_env()
         station_ids = sorted(env._require_entity_manager().stations)
@@ -1894,7 +1942,7 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(resolved_mode_c.mode, PolicyMode.C)
         self.assertEqual(resolved_mode_c.recover_node_id, station_safe.station_id)
 
-    def test_candidate_builder_deadline_sort_centers_lead_time(self) -> None:
+    def test_candidate_builder_deadline_sort_uses_earliest_ddl(self) -> None:
         items = [
             self._candidate_sort_item("A", 480.0),
             self._candidate_sort_item("B", 300.0),
@@ -1910,15 +1958,9 @@ class TestPhase6Integration(unittest.TestCase):
             item["order_id"] for item in sorted(items, key=_candidate_deadline_sort_key)
         ]
 
-        self.assertEqual(sorted_ids[0], "A")
-        self.assertLess(sorted_ids.index("B"), 4)
-        self.assertLess(sorted_ids.index("C"), 4)
-        self.assertLess(sorted_ids.index("E"), sorted_ids.index("F"))
-        self.assertLess(sorted_ids.index("E"), sorted_ids.index("G"))
-        self.assertLess(sorted_ids.index("D"), sorted_ids.index("G"))
-        self.assertEqual(sorted_ids[-1], "H")
+        self.assertEqual(sorted_ids, ["G", "F", "E", "D", "B", "A", "C", "H"])
 
-    def test_candidate_builder_overdue_reserve_keeps_limited_visibility(self) -> None:
+    def test_candidate_builder_truncates_to_earliest_ddl_orders(self) -> None:
         items = [
             self._candidate_sort_item("A", 480.0),
             self._candidate_sort_item("B", 500.0),
@@ -1935,18 +1977,15 @@ class TestPhase6Integration(unittest.TestCase):
 
         self.assertEqual(len(selected_ids), 5)
         self.assertEqual(len(selected_ids), len(set(selected_ids)))
-        self.assertEqual(set(selected_ids[:3]), {"A", "B", "C"})
-        self.assertIn("E", selected_ids)
-        self.assertIn("F", selected_ids)
-        self.assertNotIn("G", selected_ids)
+        self.assertEqual(selected_ids, ["G", "F", "E", "D", "C"])
 
         all_selected = _select_candidate_orders(
             items,
             max_candidate_orders=len(items),
         )
         self.assertEqual(
-            {item["order_id"] for item in all_selected},
-            {item["order_id"] for item in items},
+            [item["order_id"] for item in all_selected],
+            ["G", "F", "E", "D", "C", "A", "B", "H"],
         )
 
     def test_candidate_builder_mode_c_prefers_earliest_recovery_time(self) -> None:

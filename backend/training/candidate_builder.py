@@ -45,9 +45,6 @@ from .uav_path_service import TrainingUavPathService
 _TIME_EPS = 1e-6
 _MODE_B_IDX = 0
 _MODE_C_IDX = 1
-_DEADLINE_LEAD_TIME_SEC = 480.0
-_OVERDUE_SCORE_CAP_SEC = 600.0
-_OLD_OVERDUE_RESERVE_SLOTS = 2
 
 
 @dataclass(frozen=True)
@@ -1108,26 +1105,9 @@ def _is_riding_with_truck_trigger(trigger_type: str) -> bool:
 
 def _candidate_deadline_sort_key(
     item: Mapping[str, Any],
-) -> tuple[float, int, int, float, str]:
+) -> tuple[float, str]:
     order_feature = item["order_feature"]
-    slack = float(order_feature.remaining_time)
-    lead = _DEADLINE_LEAD_TIME_SEC
-    if slack >= 0.0:
-        deadline_score = abs(slack - lead)
-        overdue_rank = 1
-        tail_score = max(0.0, slack - lead)
-    else:
-        lateness = -slack
-        deadline_score = lead + min(lateness, _OVERDUE_SCORE_CAP_SEC)
-        overdue_rank = 0
-        tail_score = lateness
-    return (
-        deadline_score,
-        overdue_rank,
-        int(order_feature.priority_band),
-        tail_score,
-        str(item["order_id"]),
-    )
+    return (float(order_feature.deadline), str(item["order_id"]))
 
 
 def _select_candidate_orders(
@@ -1135,43 +1115,13 @@ def _select_candidate_orders(
     *,
     max_candidate_orders: int,
 ) -> list[dict[str, Any]]:
+    if max_candidate_orders <= 0:
+        return []
     sorted_actionable_orders = sorted(
         actionable_orders,
         key=_candidate_deadline_sort_key,
     )
-    if len(sorted_actionable_orders) <= max_candidate_orders:
-        return sorted_actionable_orders
-    if max_candidate_orders <= 0:
-        return []
-
-    reserve_slots = min(_OLD_OVERDUE_RESERVE_SLOTS, max_candidate_orders)
-    main_slots = max_candidate_orders - reserve_slots
-    main_selected = sorted_actionable_orders[:main_slots]
-    selected_order_ids = {str(item["order_id"]) for item in main_selected}
-
-    overdue_candidates = [
-        item
-        for item in sorted_actionable_orders[main_slots:]
-        if float(item["order_feature"].remaining_time) < 0.0
-        and str(item["order_id"]) not in selected_order_ids
-    ]
-    reserve_selected = overdue_candidates[:reserve_slots]
-
-    selected = list(main_selected)
-    for item in reserve_selected:
-        selected.append(item)
-        selected_order_ids.add(str(item["order_id"]))
-
-    for item in sorted_actionable_orders[main_slots:]:
-        if len(selected) >= max_candidate_orders:
-            break
-        order_id = str(item["order_id"])
-        if order_id in selected_order_ids:
-            continue
-        selected.append(item)
-        selected_order_ids.add(order_id)
-
-    return selected[:max_candidate_orders]
+    return sorted_actionable_orders[:max_candidate_orders]
 
 
 def _validate_trigger_context(

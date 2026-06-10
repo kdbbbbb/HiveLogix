@@ -17,7 +17,7 @@ import copy
 import hashlib
 import random
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
@@ -271,6 +271,15 @@ def build_order_source(
         scene_ctx=scene_ctx,
         mode=selected_mode,
     )
+    if selected_mode == OrderSourceMode.BENCHMARK:
+        replay_order_count = len(scheduled_dynamic_orders) + len(
+            initial_static_uav_orders
+        )
+        if replay_order_count > poisson_gen_config.max_orders_per_episode:
+            poisson_gen_config = replace(
+                poisson_gen_config,
+                max_orders_per_episode=replay_order_count,
+            )
 
     benchmark = _build_benchmark_meta(
         scene_ctx=scene_ctx,

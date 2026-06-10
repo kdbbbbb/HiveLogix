@@ -26,6 +26,7 @@ import json
 import math
 import random
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping, TypeAlias
@@ -605,6 +606,7 @@ class TrainingEnvAdapter:
         self._episode_uav_energy_penalty_events = 0
         self._runtime_uav_completed_distance_m = 0.0
         self._runtime_uav_completed_energy_j = 0.0
+        self._debug_trace_path: Path | None = None
         self._planner_bridge = (
             planner_bridge
             if planner_bridge is not None
@@ -630,6 +632,64 @@ class TrainingEnvAdapter:
 
         self._order_source = order_source
         self._current_episode_order_source_seed = int(order_source.seed)
+
+    def set_debug_trace_path(self, path: str | Path | None) -> None:
+        """设置可选 jsonl 调试 trace；None 表示关闭。"""
+
+        self._debug_trace_path = Path(path) if path is not None else None
+
+    def _append_debug_trace(self, payload: Mapping[str, Any]) -> None:
+        if self._debug_trace_path is None:
+            return
+        record = dict(payload)
+        record.setdefault("wall_time", datetime.now().astimezone().isoformat())
+        record.setdefault("wall_time_utc", datetime.now(timezone.utc).isoformat())
+        with self._debug_trace_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _build_done_condition_debug(self) -> dict[str, Any]:
+        order_mgr = self._order_manager
+        scheduled_dynamic = (
+            [] if order_mgr is None else list(getattr(order_mgr, "_scheduled_dynamic", []))
+        )
+        scheduled_i = (
+            0 if order_mgr is None else int(getattr(order_mgr, "_scheduled_dynamic_i", 0))
+        )
+        next_poisson = (
+            math.inf
+            if order_mgr is None
+            else float(getattr(order_mgr, "_next_order_time", math.inf))
+        )
+        pending_count = 0 if order_mgr is None else len(order_mgr.pending_orders)
+        assigned_count = 0 if order_mgr is None else len(order_mgr.assigned_orders)
+        has_future_orders = self._has_future_order_arrivals()
+        has_mode_c_obligation = self._has_active_mode_c_recovery_obligation()
+        return {
+            "done_pending_order_count": pending_count,
+            "done_assigned_order_count": assigned_count,
+            "done_background_mode_a_pending_count": len(
+                self._background_mode_a_pending
+            ),
+            "done_background_mode_a_pending_sample": sorted(
+                str(order_id) for order_id in self._background_mode_a_pending
+            )[:8],
+            "done_has_poisson_stream": bool(self._order_source.has_poisson_stream),
+            "done_next_poisson_time": next_poisson,
+            "done_scheduled_dynamic_i": scheduled_i,
+            "done_scheduled_dynamic_count": len(scheduled_dynamic),
+            "done_has_future_order_arrivals": bool(has_future_orders),
+            "done_has_active_mode_c_recovery_obligation": bool(
+                has_mode_c_obligation
+            ),
+            "done_is_done": bool(
+                order_mgr is not None
+                and pending_count == 0
+                and assigned_count == 0
+                and not self._background_mode_a_pending
+                and not has_future_orders
+                and not has_mode_c_obligation
+            ),
+        }
 
     def reset(self) -> EnvStepResult:
         """重建一个全新的 episode，并返回首个可见状态。
@@ -937,6 +997,20 @@ class TrainingEnvAdapter:
             raise RuntimeError("当前没有可执行的 decision batch")
 
         batch_drone_ids = [str(ctx.deciding_drone_id) for ctx in decision_batch]
+        trace_batch_payload = {
+            "phase": "env_apply_decision_batch",
+            "sim_time": float(self._t_now),
+            "batch_size": len(decision_batch),
+            "queue_len": len(self._decision_queue),
+            "decision_ids": [int(ctx.decision_id) for ctx in decision_batch],
+            "drone_ids": batch_drone_ids,
+        }
+        self._append_debug_trace(
+            {
+                **trace_batch_payload,
+                "phase_step": "start",
+            }
+        )
         expected_drone_ids = set(batch_drone_ids)
         actual_drone_ids = {str(drone_id) for drone_id in actions_by_drone}
         if actual_drone_ids != expected_drone_ids:
@@ -947,6 +1021,7 @@ class TrainingEnvAdapter:
 
         selected_orders: list[str] = []
         normalized_actions: dict[str, EnvAction] = {}
+        action_summaries: list[dict[str, Any]] = []
         for ctx in decision_batch:
             drone_id = str(ctx.deciding_drone_id)
             action = actions_by_drone[drone_id]
@@ -955,13 +1030,42 @@ class TrainingEnvAdapter:
             normalized_actions[drone_id] = action
             if isinstance(action, DispatchAction):
                 selected_orders.append(str(action.order_id))
+                action_summaries.append(
+                    {
+                        "drone_id": drone_id,
+                        "action": "dispatch",
+                        "order_id": str(action.order_id),
+                        "mode": str(action.mode.value),
+                        "recover_node_id": (
+                            None
+                            if action.recover_node_id is None
+                            else str(action.recover_node_id)
+                        ),
+                    }
+                )
+            else:
+                action_summaries.append(
+                    {
+                        "drone_id": drone_id,
+                        "action": "wait",
+                    }
+                )
 
         if len(selected_orders) != len(set(selected_orders)):
             raise ValueError("batch 内同一个订单被多个 UAV 选择")
+        self._append_debug_trace(
+            {
+                **trace_batch_payload,
+                "phase_step": "after_prevalidation",
+                "dispatch_count": len(selected_orders),
+                "selected_orders": list(selected_orders),
+                "actions": action_summaries,
+            }
+        )
 
         t0 = float(self._t_now)
         applied_items: list[AppliedDecision] = []
-        for ctx in decision_batch:
+        for item_index, ctx in enumerate(decision_batch, start=1):
             if abs(float(self._t_now) - t0) > _TIME_EPS:
                 raise RuntimeError("batch 内单个动作提交时发生了时间推进")
             if not self._decision_queue:
@@ -972,18 +1076,74 @@ class TrainingEnvAdapter:
                     "decision_queue 顺序与预校验 batch 不一致: "
                     f"expected={ctx.decision_id}, actual={queue_head.decision_id}"
                 )
+            action = normalized_actions[str(ctx.deciding_drone_id)]
+            action_payload: dict[str, Any]
+            if isinstance(action, DispatchAction):
+                action_payload = {
+                    "action": "dispatch",
+                    "order_id": str(action.order_id),
+                    "mode": str(action.mode.value),
+                    "recover_node_id": (
+                        None
+                        if action.recover_node_id is None
+                        else str(action.recover_node_id)
+                    ),
+                }
+            else:
+                action_payload = {"action": "wait"}
+            self._append_debug_trace(
+                {
+                    **trace_batch_payload,
+                    "phase_step": "before_apply_item",
+                    "item_index": item_index,
+                    "decision_id": int(ctx.decision_id),
+                    "drone_id": str(ctx.deciding_drone_id),
+                    "queue_len_before": len(self._decision_queue),
+                    **action_payload,
+                }
+            )
             applied = self._apply_decision_core(
-                normalized_actions[str(ctx.deciding_drone_id)],
+                action,
                 prevalidated_decision=ctx,
             )
             applied_items.append(applied)
+            self._append_debug_trace(
+                {
+                    **trace_batch_payload,
+                    "phase_step": "after_apply_item",
+                    "item_index": item_index,
+                    "decision_id": int(ctx.decision_id),
+                    "drone_id": str(ctx.deciding_drone_id),
+                    "queue_len_after": len(self._decision_queue),
+                    "auto_advance_kind": str(applied.auto_advance_kind),
+                }
+            )
             if abs(float(self._t_now) - t0) > _TIME_EPS:
                 raise RuntimeError("batch 内单个动作提交后发生了时间推进")
 
         advance_reward_breakdown: dict[str, float] = {}
         if not self._decision_queue and not self.is_done():
+            self._append_debug_trace(
+                {
+                    **trace_batch_payload,
+                    "phase_step": "before_advance_until_decision_or_done",
+                    "applied_count": len(applied_items),
+                    "sim_time_before_advance": float(self._t_now),
+                }
+            )
             advance_reward_breakdown = (
                 self._advance_until_decision_or_done_collect_reward_breakdown()
+            )
+            self._append_debug_trace(
+                {
+                    **trace_batch_payload,
+                    "phase_step": "after_advance_until_decision_or_done",
+                    "sim_time_after_advance": float(self._t_now),
+                    "queue_len_after_advance": len(self._decision_queue),
+                    "advance_reward_breakdown_keys": sorted(
+                        str(key) for key in advance_reward_breakdown
+                    ),
+                }
             )
 
         per_drone_rewards: dict[str, float] = {}
@@ -1018,7 +1178,15 @@ class TrainingEnvAdapter:
             reward_breakdown["wait_opportunity"] = total_wait_opportunity
         self._last_reward_breakdown = reward_breakdown
 
-        return self._build_step_result(
+        self._append_debug_trace(
+            {
+                **trace_batch_payload,
+                "phase_step": "before_build_step_result",
+                "sim_time_before_build_result": float(self._t_now),
+                "queue_len_before_build_result": len(self._decision_queue),
+            }
+        )
+        result = self._build_step_result(
             reward=total_reward,
             info={
                 "event": "apply_decision_batch",
@@ -1028,6 +1196,20 @@ class TrainingEnvAdapter:
                 "per_drone_reward_breakdown": per_drone_reward_breakdown,
             },
         )
+        self._append_debug_trace(
+            {
+                **trace_batch_payload,
+                "phase_step": "after_build_step_result",
+                "result_done": bool(result.done),
+                "result_t_now": float(result.runtime_state.t_now),
+                "next_decision_id": (
+                    None
+                    if result.decision_context is None
+                    else int(result.decision_context.decision_id)
+                ),
+            }
+        )
+        return result
 
     def build_runtime_snapshot(self) -> dict[str, Any]:
         """构建与当前 `t_now` 对齐的运行时可视化快照。"""
@@ -2076,6 +2258,24 @@ class TrainingEnvAdapter:
         """统一 coarse plan 刷新入口。"""
         if runtime_state is None:
             runtime_state = self.build_runtime_state_view()
+        self._append_debug_trace(
+            {
+                "phase": "env_refresh_coarse_plan",
+                "phase_step": "start",
+                "t_now": float(runtime_state.t_now),
+                "allow_truck_route_replan": bool(allow_truck_route_replan),
+                "force_replan": bool(force_replan),
+                "current_plan_version": (
+                    None
+                    if self._current_coarse_plan is None
+                    else int(self._current_coarse_plan.plan_version)
+                ),
+                "truck_replan_pending": bool(self._truck_replan_pending),
+                "truck_replan_pending_reasons": sorted(
+                    str(reason) for reason in self._truck_replan_pending_reasons
+                ),
+            }
+        )
 
         require_station_backbone = self._ensure_future_backbone_capacity(runtime_state)
         if require_station_backbone and self._planner_bridge is None:
@@ -2100,6 +2300,24 @@ class TrainingEnvAdapter:
             runtime_state=runtime_state,
             reservation_constraints=reservation_constraints,
             truck_mandatory_orders=truck_mandatory_orders,
+        )
+        self._append_debug_trace(
+            {
+                "phase": "env_refresh_coarse_plan",
+                "phase_step": "after_replan_inputs",
+                "t_now": float(runtime_state.t_now),
+                "require_station_backbone": bool(require_station_backbone),
+                "reservation_constraint_count": len(reservation_constraints),
+                "truck_mandatory_order_count": len(truck_mandatory_orders),
+                "allow_tail_empty_backbone": bool(allow_tail_empty_backbone),
+                "truck_replan_pressure": bool(truck_replan_pressure),
+                "allow_truck_route_replan": bool(allow_truck_route_replan),
+                "truck_replan_pending": bool(self._truck_replan_pending),
+                "truck_replan_pending_reasons": sorted(
+                    str(reason) for reason in self._truck_replan_pending_reasons
+                ),
+                **self._build_done_condition_debug(),
+            }
         )
         allow_deferred_empty_backbone = False
         if truck_replan_pressure and not allow_truck_route_replan:
@@ -2149,6 +2367,29 @@ class TrainingEnvAdapter:
                 hard_failure_count_in_window=trigger_ctx.hard_failure_count_in_window,
                 route_drift_ratio=trigger_ctx.route_drift_ratio,
             )
+        self._append_debug_trace(
+            {
+                "phase": "env_refresh_coarse_plan",
+                "phase_step": "before_maybe_replan",
+                "t_now": float(runtime_state.t_now),
+                "trigger_backlog_new_orders": int(trigger_ctx.backlog_new_orders),
+                "trigger_fallback_count_in_window": int(
+                    trigger_ctx.fallback_count_in_window
+                ),
+                "trigger_hard_failure_count_in_window": int(
+                    trigger_ctx.hard_failure_count_in_window
+                ),
+                "trigger_route_drift_ratio": float(trigger_ctx.route_drift_ratio),
+                "planner_reservation_constraint_count": len(
+                    planner_reservation_constraints
+                ),
+                "allow_empty_backbone_route": bool(
+                    self._allow_empty_backbone_route
+                    or allow_tail_empty_backbone
+                    or allow_deferred_empty_backbone
+                ),
+            }
+        )
         coarse_plan = self._planner_bridge.maybe_replan(
             planner_runtime_state,
             trigger_ctx,
@@ -2159,6 +2400,23 @@ class TrainingEnvAdapter:
                 or allow_deferred_empty_backbone
             ),
         )
+        self._append_debug_trace(
+            {
+                "phase": "env_refresh_coarse_plan",
+                "phase_step": "after_maybe_replan",
+                "t_now": float(runtime_state.t_now),
+                "returned_plan_version": int(coarse_plan.plan_version),
+                "current_plan_version_before_apply": (
+                    None
+                    if self._current_coarse_plan is None
+                    else int(self._current_coarse_plan.plan_version)
+                ),
+                "truck_plan_stop_count": len(coarse_plan.truck_plan_stops),
+                "launch_candidate_station_count": len(
+                    coarse_plan.launch_candidate_stations
+                ),
+            }
+        )
         if (
             self._current_coarse_plan is None
             or coarse_plan.plan_version > self._current_coarse_plan.plan_version
@@ -2166,9 +2424,33 @@ class TrainingEnvAdapter:
             self._current_coarse_plan = coarse_plan
             if coarse_plan.truck_plan_stops:
                 if allow_truck_route_replan:
+                    self._append_debug_trace(
+                        {
+                            "phase": "env_refresh_coarse_plan",
+                            "phase_step": "before_apply_dynamic_truck_plan",
+                            "t_now": float(runtime_state.t_now),
+                            "truck_route_ready_at": float(truck_route_ready_at),
+                            "truck_plan_stop_count": len(
+                                coarse_plan.truck_plan_stops
+                            ),
+                        }
+                    )
                     self._apply_dynamic_truck_plan(
                         coarse_plan.truck_plan_stops,
                         route_start_time=truck_route_ready_at,
+                    )
+                    self._append_debug_trace(
+                        {
+                            "phase": "env_refresh_coarse_plan",
+                            "phase_step": "after_apply_dynamic_truck_plan",
+                            "t_now": float(runtime_state.t_now),
+                            "planned_route_stop_count": len(
+                                self._planned_route_stops
+                            ),
+                            "planned_route_segment_count": len(
+                                self._planned_route_segments
+                            ),
+                        }
                     )
                     applied_to_truck_route = True
                     self._clear_truck_replan_pending()
@@ -2193,6 +2475,22 @@ class TrainingEnvAdapter:
             )
             self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
             self._completed_backbone_nodes_since_plan.clear()
+        self._append_debug_trace(
+            {
+                "phase": "env_refresh_coarse_plan",
+                "phase_step": "end",
+                "t_now": float(runtime_state.t_now),
+                "current_plan_version": (
+                    None
+                    if self._current_coarse_plan is None
+                    else int(self._current_coarse_plan.plan_version)
+                ),
+                "truck_replan_pending": bool(self._truck_replan_pending),
+                "truck_replan_pending_reasons": sorted(
+                    str(reason) for reason in self._truck_replan_pending_reasons
+                ),
+            }
+        )
 
         self._prune_active_launch_stations(runtime_state)
         return self._current_coarse_plan
@@ -2234,9 +2532,10 @@ class TrainingEnvAdapter:
         if order_mgr is None:
             return False
 
-        next_poisson = float(getattr(order_mgr, "_next_order_time", math.inf))
-        if next_poisson <= self._cfg.upper_horizon_sec + _TIME_EPS:
-            return True
+        if self._order_source.has_poisson_stream:
+            next_poisson = float(getattr(order_mgr, "_next_order_time", math.inf))
+            if next_poisson <= self._cfg.upper_horizon_sec + _TIME_EPS:
+                return True
 
         scheduled_dynamic = list(getattr(order_mgr, "_scheduled_dynamic", []))
         scheduled_i = int(getattr(order_mgr, "_scheduled_dynamic_i", 0))
@@ -3617,7 +3916,9 @@ class TrainingEnvAdapter:
     def _advance_until_decision_or_done_collect_reward_breakdown(self) -> dict[str, float]:
         """持续推进到下一决策点，并返回推进期间聚合的 reward breakdown。"""
         reward_breakdown: dict[str, float] = {}
+        advance_iter = 0
         while not self.is_done() and not self._decision_queue:
+            advance_iter += 1
             next_time = self._next_event_time()
             if math.isinf(next_time):
                 if self._enforces_upper_horizon():
@@ -3632,7 +3933,45 @@ class TrainingEnvAdapter:
                     if self._enforces_upper_horizon()
                     else self._t_now + 1.0
                 )
+            self._append_debug_trace(
+                {
+                    "phase": "env_advance_until_decision_or_done",
+                    "phase_step": "before_advance_to_event",
+                    "advance_iter": advance_iter,
+                    "t_now": float(self._t_now),
+                    "t_next": float(next_time),
+                    "decision_queue_len": len(self._decision_queue),
+                    "flight_leg_count": len(self._flight_legs),
+                    "delivery_service_leg_count": len(self._delivery_service_legs),
+                    "fallback_leg_count": len(self._fallback_leg),
+                    "reservation_count": len(self._reservations),
+                    "pending_order_count": (
+                        0
+                        if self._order_manager is None
+                        else len(self._order_manager.pending_orders)
+                    ),
+                    "assigned_order_count": (
+                        0
+                        if self._order_manager is None
+                        else len(self._order_manager.assigned_orders)
+                    ),
+                    **self._build_done_condition_debug(),
+                }
+            )
             self._advance_to_event(next_time)
+            self._append_debug_trace(
+                {
+                    "phase": "env_advance_until_decision_or_done",
+                    "phase_step": "after_advance_to_event",
+                    "advance_iter": advance_iter,
+                    "t_now": float(self._t_now),
+                    "decision_queue_len": len(self._decision_queue),
+                    "last_reward_breakdown_keys": sorted(
+                        str(key) for key in self._last_reward_breakdown
+                    ),
+                    **self._build_done_condition_debug(),
+                }
+            )
             _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
         return reward_breakdown
 
@@ -3656,6 +3995,16 @@ class TrainingEnvAdapter:
         entity_mgr = self._require_entity_manager()
         truck = self._require_truck()
         order_mgr = self._require_order_manager()
+        self._append_debug_trace(
+            {
+                "phase": "env_advance_to_event",
+                "phase_step": "start",
+                "t_now": float(self._t_now),
+                "t_next": float(t_next),
+                "decision_queue_len": len(self._decision_queue),
+                **self._build_done_condition_debug(),
+            }
+        )
 
         self._sync_in_transit_positions(t_next)
 
@@ -3683,6 +4032,22 @@ class TrainingEnvAdapter:
         ]
         delivery_service_ready = self._collect_delivery_service_events(t_next)
         truck_stops = self._collect_truck_stops(t_next)
+        self._append_debug_trace(
+            {
+                "phase": "env_advance_to_event",
+                "phase_step": "after_collect_events",
+                "t_now": float(self._t_now),
+                "t_next": float(t_next),
+                "hard_failure_ready_count": len(hard_failure_ready),
+                "delivery_ready_count": len(delivery_ready),
+                "non_delivery_ready_count": len(non_delivery_ready),
+                "delivery_service_ready_count": len(delivery_service_ready),
+                "truck_stop_count": len(truck_stops),
+                "truck_stop_node_types": [
+                    str(stop.node_type) for stop in truck_stops
+                ],
+            }
+        )
 
         event_reward = 0.0
         delivery_reward = 0.0
@@ -3849,6 +4214,21 @@ class TrainingEnvAdapter:
 
         # 5. poisson / benchmark 动态订单注入
         order_mgr.tick(t_next, entity_mgr)
+        self._append_debug_trace(
+            {
+                "phase": "env_advance_to_event",
+                "phase_step": "after_event_processing_before_time_set",
+                "t_now": float(self._t_now),
+                "t_next": float(t_next),
+                "pending_order_count": len(order_mgr.pending_orders),
+                "assigned_order_count": len(order_mgr.assigned_orders),
+                "decision_queue_len": len(self._decision_queue),
+                "flight_leg_count": len(self._flight_legs),
+                "delivery_service_leg_count": len(self._delivery_service_legs),
+                "fallback_leg_count": len(self._fallback_leg),
+                **self._build_done_condition_debug(),
+            }
+        )
 
         # 6. 生成 decision context / done
         self._t_now = float(t_next)
@@ -3865,9 +4245,40 @@ class TrainingEnvAdapter:
             for stop in truck_stops
             if stop.node_type in {"customer", "station", "depot"}
         )
+        self._append_debug_trace(
+            {
+                "phase": "env_advance_to_event",
+                "phase_step": "before_refresh_coarse_plan_after_event",
+                "t_now": float(self._t_now),
+                "truck_stop_at_event_time": bool(truck_stop_at_event_time),
+                "truck_stop_count": len(truck_stops),
+                "truck_replan_pending": bool(self._truck_replan_pending),
+                "truck_replan_pending_reasons": sorted(
+                    str(reason) for reason in self._truck_replan_pending_reasons
+                ),
+                **self._build_done_condition_debug(),
+            }
+        )
         self._refresh_coarse_plan_if_needed(
             refreshed_runtime_state,
             allow_truck_route_replan=truck_stop_at_event_time,
+        )
+        self._append_debug_trace(
+            {
+                "phase": "env_advance_to_event",
+                "phase_step": "after_refresh_coarse_plan_after_event",
+                "t_now": float(self._t_now),
+                "decision_queue_len": len(self._decision_queue),
+                "truck_replan_pending": bool(self._truck_replan_pending),
+                "truck_replan_pending_reasons": sorted(
+                    str(reason) for reason in self._truck_replan_pending_reasons
+                ),
+                "current_plan_version": (
+                    None
+                    if self._current_coarse_plan is None
+                    else int(self._current_coarse_plan.plan_version)
+                ),
+            }
         )
         for stop in station_arrivals:
             if stop.node_id in self._active_launch_stations:

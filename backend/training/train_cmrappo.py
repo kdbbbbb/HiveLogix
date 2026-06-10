@@ -2848,6 +2848,12 @@ def _run_bc_warm_start(
     last_loss: float | None = None
     global_update = 0
     model.train()
+    bc_warm_start_progress_path = metrics_path.with_name(
+        "bc_warm_start_progress.jsonl"
+    )
+    bc_warm_start_phase_trace_path = metrics_path.with_name(
+        "bc_warm_start_phase_trace.jsonl"
+    )
     partial_checkpoint_path = (
         checkpoint_path.with_name(
             f"{checkpoint_path.stem}_partial{checkpoint_path.suffix}"
@@ -3043,6 +3049,7 @@ def _run_bc_warm_start(
             order_source=stage_order_source,
             config_path=config_path,
         )
+        bc_env.set_debug_trace_path(metrics_path.with_name("bc_env_apply_trace.jsonl"))
         stage_learning_rate = float(stage.learning_rate)
         _set_optimizer_learning_rate(stage_learning_rate)
         continuous_episode_active = False
@@ -3139,6 +3146,25 @@ def _run_bc_warm_start(
                         raise RuntimeError(
                             "BC teacher rollout 遇到非终止且无 decision batch 的状态"
                         )
+                    trace_base_payload = {
+                        "bc_update": global_update,
+                        "bc_stage_name": str(stage.name),
+                        "bc_stage_index": stage_index,
+                        "bc_stage_update": stage_update_idx,
+                        "bc_stage_order_source_mode": str(stage_mode.value),
+                        "rollout_decision_batches_next": rollout_decision_batches + 1,
+                        "update_decision_batches_next": update_decision_batches + 1,
+                        "decision_batch_size": len(decision_batch),
+                        "sim_time_before": float(decision_batch[0].t_decision),
+                    }
+                    _append_metrics(
+                        bc_warm_start_phase_trace_path,
+                        {
+                            "phase": "bc_warm_start_phase",
+                            "phase_step": "start_batch",
+                            **trace_base_payload,
+                        },
+                    )
 
                     candidate_outputs_by_drone = {
                         str(context.deciding_drone_id): bc_env.build_candidate_output(
@@ -3149,6 +3175,18 @@ def _run_bc_warm_start(
                         )
                         for context in decision_batch
                     }
+                    _append_metrics(
+                        bc_warm_start_phase_trace_path,
+                        {
+                            "phase": "bc_warm_start_phase",
+                            "phase_step": "after_candidate_outputs",
+                            "dispatch_action_count": sum(
+                                len(candidate_out.resolved_action_lookup.dispatch_actions)
+                                for candidate_out in candidate_outputs_by_drone.values()
+                            ),
+                            **trace_base_payload,
+                        },
+                    )
                     if all(
                         hasattr(candidate_out, "candidate_features")
                         for candidate_out in candidate_outputs_by_drone.values()
@@ -3165,9 +3203,25 @@ def _run_bc_warm_start(
                                 ),
                             )
                         )
+                    _append_metrics(
+                        bc_warm_start_phase_trace_path,
+                        {
+                            "phase": "bc_warm_start_phase",
+                            "phase_step": "after_attach_hints",
+                            **trace_base_payload,
+                        },
+                    )
                     teacher_result = build_batch_matching_teacher_labels(
                         decision_contexts=tuple(decision_batch),
                         candidate_outputs_by_drone=candidate_outputs_by_drone,
+                    )
+                    _append_metrics(
+                        bc_warm_start_phase_trace_path,
+                        {
+                            "phase": "bc_warm_start_phase",
+                            "phase_step": "after_teacher_labels",
+                            **trace_base_payload,
+                        },
                     )
 
                     for context in decision_batch:
@@ -3300,6 +3354,16 @@ def _run_bc_warm_start(
                         )
                         update_loss_weight_sum += float(sample_weight)
                         update_loss_sample_count += 1
+                    _append_metrics(
+                        bc_warm_start_phase_trace_path,
+                        {
+                            "phase": "bc_warm_start_phase",
+                            "phase_step": "after_model_loss_terms",
+                            "samples_so_far": update_samples,
+                            "loss_sample_count_so_far": update_loss_sample_count,
+                            **trace_base_payload,
+                        },
+                    )
 
                     step_result = bc_env.apply_decision_batch(
                         teacher_result.actions_by_drone
@@ -3308,6 +3372,28 @@ def _run_bc_warm_start(
                     if not reset_each_update:
                         continuous_rollout_decision_batches = rollout_decision_batches
                     update_decision_batches += 1
+                    _append_metrics(
+                        bc_warm_start_progress_path,
+                        {
+                            "phase": "bc_warm_start_progress",
+                            "bc_update": global_update,
+                            "bc_stage_name": str(stage.name),
+                            "bc_stage_index": stage_index,
+                            "bc_stage_update": stage_update_idx,
+                            "bc_stage_order_source_mode": str(stage_mode.value),
+                            "rollout_decision_batches": rollout_decision_batches,
+                            "update_decision_batches": update_decision_batches,
+                            "decision_batch_size": len(decision_batch),
+                            "samples_so_far": update_samples,
+                            "dispatch_so_far": update_dispatch,
+                            "wait_so_far": update_wait,
+                            "forced_wait_no_dispatch_so_far": (
+                                update_forced_wait_no_dispatch
+                            ),
+                            "sim_time": float(step_result.runtime_state.t_now),
+                            "done": bool(step_result.done),
+                        },
+                    )
                     if step_result.done:
                         update_completed_rollouts += 1
                         if not reset_each_update:
@@ -4558,8 +4644,11 @@ def _build_meta_payload(
 
 
 def _append_metrics(path: Path, payload: Mapping[str, Any]) -> None:
+    record = dict(payload)
+    record.setdefault("wall_time", datetime.now().astimezone().isoformat())
+    record.setdefault("wall_time_utc", datetime.now(timezone.utc).isoformat())
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _append_planner_replan_events(

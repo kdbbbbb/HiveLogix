@@ -69,13 +69,13 @@
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
+                :disabled="classicDispatchDisabled"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
                 🧩 贪心（增量）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
-                :disabled="!initDone || dispatchLoading"
+                :disabled="classicDispatchDisabled"
                 @click="dispatchSolver = 'ga_mmce'">
                 🧬 遗传算法
               </button>
@@ -90,12 +90,12 @@
                 <input
                   v-model="reuseGaStaticPlan"
                   type="checkbox"
-                  :disabled="dispatchLoading"
+                  :disabled="classicDispatchDisabled"
                 >
                 <span>复用上次静态结果</span>
               </label>
               <button class="sc-btn sc-btn--dispatch sc-btn--dispatch-run"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
+                :disabled="classicDispatchDisabled"
                 @click="doDispatch">
                 {{ dispatchLoading ? '⏳ 调度中...' : `🎯 批量${dispatchSolverLabel(dispatchSolver)}调度` }}
               </button>
@@ -317,6 +317,13 @@ const lastRenderedDecisionEventSeq = ref(0)
 type DispatchSolverName = 'greedy_mmce_bi' | 'ga_mmce'
 const dispatchSolver = ref<DispatchSolverName>('greedy_mmce_bi')
 const reuseGaStaticPlan = ref(false)
+const classicDispatchDisabled = computed(() =>
+  !initDone.value ||
+  dispatchLoading.value ||
+  policyLoading.value ||
+  systemStore.policyActive ||
+  systemStore.trainingRunning
+)
 
 function dispatchSolverLabel(solver: DispatchSolverName): string {
   if (solver === 'greedy_mmce_bi') return '贪心（增量）'
@@ -732,6 +739,14 @@ async function doPpoPolicyButton() {
 }
 
 async function doDispatch() {
+  if (systemStore.policyActive) {
+    _log('warn', '⚠️ PPO 模式下 classic 调度按钮已禁用')
+    return
+  }
+  if (systemStore.trainingRunning) {
+    _log('warn', '⚠️ PPO 训练直播中 classic 调度按钮已禁用')
+    return
+  }
   dispatchLoading.value = true
   _log('info', `🎯 正在执行${dispatchSolverLabel(dispatchSolver.value)}调度算法...`)
   try {
