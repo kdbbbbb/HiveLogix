@@ -6,7 +6,7 @@ HiveLogix — Phase 4 卡车路线导出与 SUMO 验证产物生成。
 设计原则：
   - 区分卡车完整执行路线与 `truck_backbone_route`；
   - 完整执行路线包含 `depot / customer / station`；
-  - `truck_backbone_route` 仅保留未来固定节点（`station / depot`）；
+  - `truck_backbone_route` 仅保留未来 station 交接节点；
   - 订单访问顺序：deadline 为主，OSM 路网最短路径距离为 tie-break；
   - 充换电站插入：以额外行驶时间为底，叠加 Mode C 回收机会 bonus；
   - ETA 使用 OSM 实际可达路径长度 / `truck.speed` 计算，不使用曼哈顿距离。

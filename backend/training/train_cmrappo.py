@@ -1967,6 +1967,21 @@ def _summarize_episode_records(
     completed_with_tardiness_total = int(
         sum(int(item.get("completed_with_timing_order_count", 0)) for item in episodes)
     )
+    truck_distance_total_m = float(
+        sum(float(item.get("truck_distance_m", 0.0)) for item in episodes)
+    )
+    uav_distance_total_m = float(
+        sum(float(item.get("uav_distance_m", 0.0)) for item in episodes)
+    )
+    truck_energy_total_wh = float(
+        sum(float(item.get("truck_energy_wh", 0.0)) for item in episodes)
+    )
+    uav_energy_total_wh = float(
+        sum(float(item.get("uav_energy_wh", 0.0)) for item in episodes)
+    )
+    total_energy_cost_wh = float(
+        sum(float(item.get("total_energy_cost_wh", 0.0)) for item in episodes)
+    )
     for item in episodes:
         for reason_key, count in dict(
             item.get("mode_c_post_delivery_revalidation_fail_reasons", {})
@@ -2156,6 +2171,20 @@ def _summarize_episode_records(
         ),
         "sum_episode_uav_energy_penalty_events": int(
             sum(int(item.get("episode_uav_energy_penalty_events", 0)) for item in episodes)
+        ),
+        "sum_truck_distance_m": float(truck_distance_total_m),
+        "sum_uav_distance_m": float(uav_distance_total_m),
+        "sum_truck_energy_wh": float(truck_energy_total_wh),
+        "sum_uav_energy_wh": float(uav_energy_total_wh),
+        "sum_total_energy_cost_wh": float(total_energy_cost_wh),
+        "sum_truck_energy_kwh": float(truck_energy_total_wh / 1000.0),
+        "sum_uav_energy_kwh": float(uav_energy_total_wh / 1000.0),
+        "sum_total_energy_cost_kwh": float(total_energy_cost_wh / 1000.0),
+        "mean_truck_energy_wh": float(truck_energy_total_wh / float(episode_count)),
+        "mean_uav_energy_wh": float(uav_energy_total_wh / float(episode_count)),
+        "mean_total_energy_cost_wh": float(total_energy_cost_wh / float(episode_count)),
+        "mean_total_energy_cost_kwh": float(
+            total_energy_cost_wh / float(episode_count) / 1000.0
         ),
         "mode_b_dispatch_ratio": (
             float(mode_b_total / dispatch_total) if dispatch_total > 0.0 else 0.0

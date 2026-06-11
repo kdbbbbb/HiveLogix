@@ -1,4 +1,4 @@
-# HiveLogix — RH-ALNS + CMRAPPO 离线训练/验证算法专属配置
+# HiveLogix — RH-ALNS + CMRAPPO 正式训练配置（poisson two-stage warmup + PPO + DDL-sorted candidates）
 # =============================================================================
 # 适用范围：
 #   - default_scene（约 4.0km × 4.0km）
@@ -16,7 +16,7 @@
 #   - 站点最近邻间距：均值约 949m
 #   - 订单到最近站点距离：均值约 500m
 #   - benchmark primary 动态订单强度：当前 orders_ppo_training_intensity.json 约 2.14 单/分钟
-#   - 当前 PPO 训练中档泊松强度：提高到 2.40 单/分钟，略高于 benchmark primary 动态流
+#   - 当前 PPO 训练泊松强度：取 2.15 单/分钟，对齐 benchmark primary 动态流
 # =============================================================================
 
 scene:
@@ -29,7 +29,7 @@ scene:
   scene_config_file: scene_config.json
   entities_file: entities.json
   # benchmark 订单流固定使用该文件（由 scene.orders_file 提供给 benchmark replay）
-  orders_file: orders_ppo_training_intensity.json
+  orders_file: orders_ppo_training_intensity_low_poisson_ddl25_45.json
   osm_network_file: osm_network.geojson
   osm_network_format: geojson
 
@@ -57,8 +57,7 @@ scene:
 data:
   # 统一订单源模式：
   #   benchmark: static_orders + dynamic_orders, arrival_rate = 0
-  #   poisson:   static_orders 中 UAV-capable 单在 t=0 注入，truck-only 单作卡车骨架 / mode A 背景，
-  #              后续动态订单由泊松流生成
+  #   poisson:   static_orders 仅作卡车骨架 / mode A 背景，动态订单纯泊松生成
   #   hybrid:    static_orders + dynamic_orders + 泊松流
   order_source_mode: poisson
 
@@ -75,13 +74,12 @@ data:
   c_sensitive_eval_min_legal_mode_c_recovery_nodes: 1
 
   # 训练主输入：泊松流。
-  # 略高于 default_scene/orders_ppo_training_intensity.json 的 primary 动态单：
+  # 对齐 default_scene/orders_ppo_training_intensity.json 的 primary 动态单：
   #   - 108 个 <=10kg 订单分布在 0~3000s，平均间隔约 28.0s
-  #   - benchmark 等效到达频率约 2.14/min
-  #   - 训练中档取 2.40/min，制造更密集的动态到达压力
+  #   - 等效到达频率约 2.14/min
   #   - max_orders=113 与 5 个 truck-only 预定义扰动配合，约束总动态单规模
   # 单位固定为 单/分钟，与 Phase 1 文档口径保持一致。
-  poisson_arrival_rate: 2.40
+  poisson_arrival_rate: 2.15
   poisson_weight_min_kg: 0.5
   poisson_weight_max_kg: 10.0
   # 分段载重采样：当前机队为 9 LightDrone(<=2kg) + 3 HeavyDrone(<=10kg)，
@@ -116,9 +114,9 @@ data:
 
   # stochastic 验证的标准强度档。
   stochastic_eval_arrival_rate_per_min:
-    low: 1.35
-    medium: 2.40
-    high: 2.70
+    low: 0.67
+    medium: 1.20
+    high: 2.15
 
   # hybrid 模式仅用于后续随机扩展验证；训练主循环不应启用。
   hybrid_background_dynamic_orders: true
@@ -161,7 +159,7 @@ planner:
   #   launch_candidate_stations=()
   #   policy_mode_mask 收缩为 {B}
   # 默认保持严格契约，空骨架仍视为错误。
-  allow_empty_backbone_route: false
+  allow_empty_backbone_route: true
 
   # WAIT 动作推进量上限（idle 状态下）。
   # 防止极长空窗把一次 WAIT 的 T_idle 惩罚拉得过大，影响训练稳定性。
@@ -177,6 +175,17 @@ planner:
   # 只要 station 位于卡车未来骨架，到站即触发车载 UAV 决策。
   support_radius_km: 1.2
   min_orders_to_trigger: 1
+  # station coverage 打分：
+  # - recovery_opportunity_bonus_sec：单个 pending UAV 订单对站点 Mode C recovery 的
+  #   基础时空价值，继续作为绕路时间抵扣项。
+  # - station_density_bonus_sec：新增覆盖订单数量占比的最高额外抵扣秒数；
+  #   只统计尚未被已选站点覆盖的订单簇，避免短距离相邻站反复吃同一批订单。
+  # - station_overlap_discount_ratio：已选站点覆盖同一订单簇时，对后续相邻站
+  #   recovery opportunity 的折扣强度。
+  recovery_opportunity_bonus_sec: 90.0
+  recovery_opportunity_bonus_cap_sec: 360.0
+  station_density_bonus_sec: 45.0
+  station_overlap_discount_ratio: 0.65
 
 candidate:
   # 对 4×4km / 10 站点规模，32 个订单候选已足以覆盖单轮局部决策的高价值区域，
@@ -311,7 +320,7 @@ reward:
   # 但仍保持显著低于 Run09 的 reward scale。
   rendezvous_arrive_bonus: 8.0
   rendezvous_bonus: 20.0
-  mode_c_attempt_bonus: 5.0
+  mode_c_attempt_bonus: 3.0
   uav_energy_penalty_coef: 10.0
   uav_energy_penalty_cap_ratio: 0.35
 
@@ -335,9 +344,13 @@ training:
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 20000
-  # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
-  ppo_learning_rate: 0.0001
+  # 正式训练版：poisson fast warmup -> poisson finetune warmup -> PPO 主训练。
+  # 候选订单 DDL 排序由 backend/training/candidate_builder.py 实现，不在 YAML 中单独开关。
+  # 这里表示本次 fine-tune 的新增 step；加载 30k policy 后再跑 30k，作为正式收敛续训配置。
+  total_timesteps: 30000
+  # Convergence fine-tune: 30k 对比后 critic 已明显收敛，actor KL 偏小但业务 KPI 仍有波动；
+  # 降低 PPO 学习率，优先巩固准时率/完成率，避免后段继续把策略推向过强探索。
+  ppo_learning_rate: 0.00005
   rollout_steps: 512
   recurrent_ppo: true
   sequence_len: 16
@@ -354,7 +367,7 @@ training:
   reward_scale: 0.01
   # Mode C shaping bonus 使用训练尺度固定值，不再依赖原始 reward 经过 reward_scale 缩放。
   # rendezvous_arrive_bonus_scaled 保留为旧配置兼容字段，当前训练逻辑不再使用。
-  mode_c_attempt_bonus_scaled: 0.10
+  mode_c_attempt_bonus_scaled: 0.03
   rendezvous_arrive_bonus_scaled: 0.30
   rendezvous_bonus_scaled: 0.80
   # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
@@ -362,7 +375,8 @@ training:
   # critic loss 当前改为显式可配置：
   #   - huber：优先用于当前高方差 reward / return 场景
   #   - mse：保留为回退选项
-  entropy_coef: 0.10
+  # Convergence fine-tune: 后段 Mode C 使用率已升至约 0.52，降低 entropy 以减少动作分布抖动。
+  entropy_coef: 0.05
   value_loss_coef: 0.50
   value_loss_type: huber
   value_huber_delta: 1.0
@@ -380,29 +394,35 @@ training:
   # 并通过 apply_decision_batch() 沿 teacher 轨迹采样后续 decision batch。
   bc_warm_start_enabled: true
   # 兼容旧字段；显式配置 bc_warm_start_stages 后，训练入口以 stage updates 总和为准。
-  bc_warm_start_updates: 28
+  bc_warm_start_updates: 96
   bc_learning_rate: 0.0001
   bc_warm_start_stages:
-    - name: benchmark_teacher_bc
-      order_source_mode: benchmark
-      updates: 28
-      learning_rate: 0.0003
-  # 每个 update 只采 32 个 decision batch，但跨 update 继续同一条 episode；
-  # 仅当 episode done 时 reset，避免反复只训练 benchmark 开头片段。
+    - name: poisson_teacher_bc_fast
+      order_source_mode: poisson
+      updates: 48
+      learning_rate: 0.0002
+    - name: poisson_teacher_bc_finetune
+      order_source_mode: poisson
+      updates: 48
+      learning_rate: 0.0001
+  # poisson-only warmup 覆盖有 dispatch 但 teacher 选择 WAIT 的动态片段。
+  # 每个 update 采 64 个 decision batch，降低单个 episode 片段导致的 loss 抖动；
+  # 跨 update 继续同一条 episode，仅当 episode done 时 reset。
   bc_warm_start_batches_per_update: 1
-  bc_warm_start_decision_batches_per_update: 32
+  bc_warm_start_decision_batches_per_update: 64
   bc_warm_start_reset_each_update: false
   bc_warm_start_max_decision_batches_per_rollout: 0
   # warmup 完成后保存 bc_warm_start_policy.pt；后续重跑同一 output_dir 时优先复用，
   # 或通过 bc_warm_start_checkpoint_path 显式指定已有 warmup 产物。
   bc_warm_start_reuse_existing: false
   bc_warm_start_checkpoint_interval_updates: 10
+  # 本轮重新 warmup：必须保持为空，避免显式加载旧 policy.pt 跳过 BC warm start。
   bc_warm_start_checkpoint_path: ""
-  # BC 专用监督损失权重；降低 forced WAIT 稀释，适度放大 C 标签。
+  # BC 专用监督损失权重；跳过 forced WAIT，强化 wait-with-dispatch，C 权重略降避免继续压制 order/B 学习。
   bc_wait_no_dispatch_loss_weight: 0.0
-  bc_wait_with_dispatch_loss_weight: 0.75
+  bc_wait_with_dispatch_loss_weight: 1.00
   bc_mode_b_dispatch_loss_weight: 1.00
-  bc_mode_c_dispatch_loss_weight: 2.00
+  bc_mode_c_dispatch_loss_weight: 1.20
 
   # 正式贪心预训练固定使用 high=2.15/min；对齐 default_scene benchmark 动态单强度。
   train_arrival_curriculum_enabled: true
@@ -414,7 +434,8 @@ training:
   # 训练/评估过程控制。
   log_interval_updates: 1
   save_interval_updates: 25
-  # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
+  # 正式训练中关闭 periodic eval，避免 benchmark / stochastic eval 的 done 条件影响主训练速度。
+  # 训练完成后单独运行评估脚本做多 seed 验证。
   eval_interval_updates: 0
   benchmark_eval_episodes: 1
   stochastic_eval_seeds: 1

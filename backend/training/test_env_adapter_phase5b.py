@@ -364,6 +364,7 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         entity_mgr = env._require_entity_manager()
         station_ids = sorted(entity_mgr.stations)
         self.assertGreaterEqual(len(station_ids), 5)
+        depot = env._require_depot()
 
         preferred_station_id = station_ids[4]
         preferred_station = entity_mgr.stations[preferred_station_id]
@@ -383,6 +384,12 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
 
         env._full_backbone_cache = [
             BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=env._t_now + 30.0,
+                departure_time=env._t_now + 30.0 + 1e-6,
+            )
+        ] + [
+            BackboneVisit(
                 node_id=station_id,
                 arrival_time=env._t_now + 60.0 * (idx + 1),
                 departure_time=env._t_now + 60.0 * (idx + 1) + 1e-6,
@@ -393,6 +400,9 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         coarse_plan = env._build_coarse_plan_view(env._t_now)
         recovery_nodes = coarse_plan.recovery_pool[order.order_id]
 
+        self.assertNotIn(depot.depot_id, coarse_plan.truck_backbone_route)
+        self.assertNotIn(depot.depot_id, coarse_plan.truck_eta_map)
+        self.assertNotIn(depot.depot_id, recovery_nodes)
         self.assertLessEqual(
             len(recovery_nodes),
             env._cfg.max_candidate_recovery_per_order,

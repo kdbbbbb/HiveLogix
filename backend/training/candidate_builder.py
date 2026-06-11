@@ -17,6 +17,8 @@ HiveLogix — Phase 6 候选动作生成器。
 from __future__ import annotations
 
 import math
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -41,6 +43,8 @@ from .contracts import (
 from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
 from .uav_path_service import TrainingUavPathService
 
+
+logger = logging.getLogger(__name__)
 
 _TIME_EPS = 1e-6
 _MODE_B_IDX = 0
@@ -159,12 +163,36 @@ class CandidateBuilder:
         teacher_energy_debug: list[str] = []
 
         actionable_orders: list[dict[str, Any]] = []
-        for order_id in coarse_plan.authorized_orders:
+        authorized_orders = tuple(coarse_plan.authorized_orders)
+        build_t0 = time.perf_counter()
+        logger.info(
+            "[CANDIDATE_DIAG] build start: t=%.3f drone=%s trigger=%s station=%s "
+            "authorized_orders=%d pending=%d plan_version=%s",
+            float(runtime_state.t_now),
+            str(deciding_drone_id),
+            str(trigger_type),
+            trigger_station_id,
+            len(authorized_orders),
+            len(runtime_state.pending_orders),
+            getattr(coarse_plan, "plan_version", None),
+        )
+        for order_idx, order_id in enumerate(authorized_orders, start=1):
             mode_c_order_filter_counts["authorized_orders"] += 1
             order = runtime_state.pending_orders.get(order_id)
             if order is None:
                 mode_c_order_filter_counts["pending_missing"] += 1
                 continue
+            order_t0 = time.perf_counter()
+            logger.info(
+                "[CANDIDATE_DIAG] order start: idx=%d/%d order=%s weight=%.2f "
+                "deadline=%.1f remaining=%.1f",
+                order_idx,
+                len(authorized_orders),
+                str(order_id),
+                float(order.payload_weight),
+                float(order.deadline),
+                float(order.deadline) - float(runtime_state.t_now),
+            )
             allowed_policy_modes = coarse_plan.get_policy_modes(order_id)
             if not allowed_policy_modes:
                 mode_c_order_filter_counts["policy_mode_missing"] += 1
@@ -180,6 +208,15 @@ class CandidateBuilder:
                 from_pos=launch_pos,
                 to_pos=order.delivery_loc,
                 payload=float(order.payload_weight),
+            )
+            logger.info(
+                "[CANDIDATE_DIAG] delivery_estimate done: order=%s elapsed=%.3fs "
+                "distance_m=%.1f flight_time=%.1f energy=%.1f",
+                str(order_id),
+                time.perf_counter() - order_t0,
+                float(delivery_leg.distance_m),
+                float(delivery_leg.flight_time_sec),
+                float(delivery_leg.energy_j),
             )
             t_deliver_arrive = effective_launch_time + delivery_leg.flight_time_sec
             t_deliver_finish = (
@@ -403,6 +440,15 @@ class CandidateBuilder:
                     "teacher_energy": teacher_energy,
                 }
             )
+            logger.info(
+                "[CANDIDATE_DIAG] order done: order=%s elapsed=%.3fs has_mode_b=%s "
+                "has_mode_c=%s actionable_so_far=%d",
+                str(order_id),
+                time.perf_counter() - order_t0,
+                mode_b_summary is not None,
+                mode_c_summary is not None,
+                len(actionable_orders),
+            )
 
         pre_trunc_mode_c_order_count = sum(
             1 for item in actionable_orders if bool(item["has_mode_c"])
@@ -476,6 +522,17 @@ class CandidateBuilder:
             ),
             order_features=tuple(order_features),
             infra_features=self._build_infra_features(runtime_state, coarse_plan),
+        )
+        logger.info(
+            "[CANDIDATE_DIAG] build done: t=%.3f drone=%s elapsed=%.3fs "
+            "actionable_orders=%d dispatch_actions=%d pre_trunc_mode_c=%d post_trunc_mode_c=%d",
+            float(runtime_state.t_now),
+            str(deciding_drone_id),
+            time.perf_counter() - build_t0,
+            int(mode_c_order_filter_counts["actionable_order_post_trunc"]),
+            len(dispatch_actions),
+            int(pre_trunc_mode_c_order_count),
+            int(post_trunc_mode_c_order_count),
         )
         return CandidateOutput(
             candidate_features=candidate_features,
@@ -647,10 +704,33 @@ class CandidateBuilder:
         battery_max = max(float(getattr(drone_view, "battery_max", 0.0)), _TIME_EPS)
         feasible_count = 0
         best_item: tuple[float, float, float, str, dict[str, Any]] | None = None
-        for node_id in recovery_pool:
+        recovery_pool = tuple(recovery_pool)
+        mode_c_t0 = time.perf_counter()
+        logger.info(
+            "[CANDIDATE_DIAG] mode_c_recovery start: order=%s drone=%s pool=%d "
+            "trigger=%s station=%s t_deliver_finish=%.3f",
+            str(order.order_id),
+            str(drone_view.drone_id),
+            len(recovery_pool),
+            str(trigger_type),
+            trigger_station_id,
+            float(t_deliver_finish),
+        )
+        for node_idx, node_id in enumerate(recovery_pool, start=1):
             _increment_counter(mode_c_node_filter_counts, "recovery_node_considered")
             node_state = runtime_state.node_states.get(node_id)
             t_arrive_truck = coarse_plan.truck_eta_map.get(node_id)
+            node_t0 = time.perf_counter()
+            logger.info(
+                "[CANDIDATE_DIAG] mode_c_node start: order=%s node=%s idx=%d/%d "
+                "truck_eta=%s node_exists=%s",
+                str(order.order_id),
+                str(node_id),
+                node_idx,
+                len(recovery_pool),
+                None if t_arrive_truck is None else float(t_arrive_truck),
+                node_state is not None,
+            )
             if node_state is None:
                 _increment_counter(mode_c_node_filter_counts, "node_missing")
                 continue
@@ -666,6 +746,16 @@ class CandidateBuilder:
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
                 payload=0.0,
+            )
+            logger.info(
+                "[CANDIDATE_DIAG] mode_c_node estimate done: order=%s node=%s "
+                "elapsed=%.3fs distance_m=%.1f flight_time=%.1f energy=%.1f",
+                str(order.order_id),
+                str(node_id),
+                time.perf_counter() - node_t0,
+                float(recover_leg.distance_m),
+                float(recover_leg.flight_time_sec),
+                float(recover_leg.energy_j),
             )
             uav_flight_time = float(recover_leg.flight_time_sec)
             energy_to_recover = float(recover_leg.energy_j)
@@ -730,6 +820,12 @@ class CandidateBuilder:
                 best_item = item
 
         if best_item is None:
+            logger.info(
+                "[CANDIDATE_DIAG] mode_c_recovery done: order=%s elapsed=%.3fs "
+                "feasible=0 best=None",
+                str(order.order_id),
+                time.perf_counter() - mode_c_t0,
+            )
             return None
 
         best = best_item[4]
@@ -738,6 +834,16 @@ class CandidateBuilder:
             1.0,
             max(0.0, best_margin)
             / max(float(self._cfg.rendezvous_max_wait_sec), _TIME_EPS),
+        )
+        logger.info(
+            "[CANDIDATE_DIAG] mode_c_recovery done: order=%s elapsed=%.3fs "
+            "feasible=%d best_node=%s best_wait=%.1f best_margin=%.1f",
+            str(order.order_id),
+            time.perf_counter() - mode_c_t0,
+            int(feasible_count),
+            str(best["node_id"]),
+            float(best["wait_time"]),
+            float(best["rendezvous_margin"]),
         )
         return _ModeCSummary(
             candidate_count=int(feasible_count),

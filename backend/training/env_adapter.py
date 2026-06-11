@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import random
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -71,6 +73,8 @@ from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_defaul
 from .uav_path_service import TrainingUavPathService
 
 
+logger = logging.getLogger(__name__)
+
 NodeId: TypeAlias = str
 OrderId: TypeAlias = str
 DroneId: TypeAlias = str
@@ -78,6 +82,7 @@ DroneId: TypeAlias = str
 _TIME_EPS = 1e-6
 _BACKBONE_DEPARTURE_EPS = 1e-6
 _MIN_FUTURE_STATION_BACKBONE_VISITS = 3
+_STATION_BACKBONE_DEFERRED_BACKLOG_NEW_ORDERS = 2
 _MODE_C_REVALIDATION_REASON_KEYS = (
     "energy_feasible",
     "rendezvous_time_feasible",
@@ -227,6 +232,7 @@ class PlannerRuntimeStateView:
     truck_mandatory_orders: Mapping[str, Order]
     require_station_backbone: bool = False
     truck_route_ready_at: float | None = None
+    recent_truck_station_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -541,6 +547,8 @@ class TrainingEnvAdapter:
         self._current_coarse_plan: CoarsePlanView | None = None
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons: set[str] = set()
+        self._deferred_truck_plan_stops: tuple[TruckPlanStopView, ...] = ()
+        self._deferred_truck_plan_version: int | None = None
         self._planner_replan_events: list[dict[str, Any]] = []
         self._mode_c_revalidation_events: list[dict[str, Any]] = []
         self._mode_c_post_delivery_selection_events: list[dict[str, Any]] = []
@@ -747,6 +755,7 @@ class TrainingEnvAdapter:
         self._current_coarse_plan = None
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons.clear()
+        self._clear_deferred_truck_plan()
         self._planner_replan_events.clear()
         self._mode_c_revalidation_events.clear()
         self._mode_c_post_delivery_selection_events.clear()
@@ -827,7 +836,9 @@ class TrainingEnvAdapter:
         if self._order_source.mode == OrderSourceMode.POISSON:
             # 仅 poisson 训练模式追加巡站循环，benchmark/hybrid 保持 Phase 4 原路线。
             self._append_patrol_loop_if_needed()
-            self._allow_empty_backbone_route = False
+            self._allow_empty_backbone_route = bool(
+                self._cfg.allow_empty_backbone_route
+            )
         else:
             self._allow_empty_backbone_route = True
         if self._planner_bridge is not None:
@@ -2087,25 +2098,37 @@ class TrainingEnvAdapter:
         order_mgr = self._require_order_manager()
 
         deduped = list(self._dedup_backbone_visits(self._future_backbone_visits(t_now)))
+        node_states = self.build_runtime_state_view().node_states
+        handoff_visits = [
+            visit
+            for visit in deduped
+            if getattr(
+                node_states.get(str(visit.node_id)),
+                "node_type",
+                None,
+            )
+            == "station"
+        ]
 
-        truck_backbone_route = tuple(visit.node_id for visit in deduped)
+        truck_backbone_route = tuple(visit.node_id for visit in handoff_visits)
         if not truck_backbone_route and not self._allow_empty_backbone_route:
             raise RuntimeError("poisson 模式下不允许空骨架，请检查 patrol loop 生成逻辑")
 
-        truck_eta_map = {visit.node_id: float(visit.arrival_time) for visit in deduped}
+        truck_eta_map = {
+            visit.node_id: float(visit.arrival_time) for visit in handoff_visits
+        }
         route_drift_ref = {
             visit.node_id: RouteDriftRef(
                 eta_ref=float(visit.arrival_time),
                 route_index_ref=idx,
             )
-            for idx, visit in enumerate(deduped)
+            for idx, visit in enumerate(handoff_visits)
         }
         launch_candidate_stations = tuple(
             node_id
             for node_id in truck_backbone_route
             if node_id in self._require_entity_manager().stations
         )
-        node_states = self.build_runtime_state_view().node_states
 
         authorized_orders: list[str] = []
         order_priority_band: dict[str, int] = {}
@@ -2284,9 +2307,39 @@ class TrainingEnvAdapter:
         if self._planner_bridge is None:
             return self._build_coarse_plan_view(self._t_now)
 
-        truck_route_ready_at = self._truck_route_ready_time_for_replan(
-            float(runtime_state.t_now)
+        deferred_station_backbone_request = bool(
+            require_station_backbone and not allow_truck_route_replan
         )
+        truck_route_ready_at = self._truck_route_ready_time_for_replan(
+            float(runtime_state.t_now),
+            defer_until_next_stop=deferred_station_backbone_request,
+        )
+        if allow_truck_route_replan and self._deferred_truck_plan_stops:
+            deferred_truck_plan_stops = self._filter_current_truck_plan_stops(
+                self._deferred_truck_plan_stops,
+                reason="apply_deferred_truck_plan",
+            )
+            self._append_debug_trace(
+                {
+                    "phase": "env_refresh_coarse_plan",
+                    "phase_step": "apply_deferred_truck_plan",
+                    "t_now": float(runtime_state.t_now),
+                    "deferred_plan_version": self._deferred_truck_plan_version,
+                    "truck_route_ready_at": float(truck_route_ready_at),
+                    "truck_plan_stop_count": len(deferred_truck_plan_stops),
+                }
+            )
+            if deferred_truck_plan_stops:
+                self._apply_dynamic_truck_plan(
+                    deferred_truck_plan_stops,
+                    route_start_time=truck_route_ready_at,
+                )
+            self._clear_deferred_truck_plan()
+            self._clear_truck_replan_pending()
+            self._prune_active_launch_stations(self.build_runtime_state_view())
+            if self._current_coarse_plan is not None and not force_replan:
+                return self._current_coarse_plan
+
         reservation_constraints = self._build_truck_reservation_constraints(
             runtime_state
         )
@@ -2301,6 +2354,26 @@ class TrainingEnvAdapter:
             reservation_constraints=reservation_constraints,
             truck_mandatory_orders=truck_mandatory_orders,
         )
+        if (
+            self._deferred_truck_plan_stops
+            and not allow_truck_route_replan
+            and not force_replan
+            and not require_station_backbone
+            and not truck_replan_pressure
+        ):
+            self._append_debug_trace(
+                {
+                    "phase": "env_refresh_coarse_plan",
+                    "phase_step": "deferred_truck_plan_waiting",
+                    "t_now": float(runtime_state.t_now),
+                    "deferred_plan_version": self._deferred_truck_plan_version,
+                    "truck_plan_stop_count": len(self._deferred_truck_plan_stops),
+                }
+            )
+            if self._current_coarse_plan is not None:
+                self._prune_active_launch_stations(runtime_state)
+                return self._current_coarse_plan
+
         self._append_debug_trace(
             {
                 "phase": "env_refresh_coarse_plan",
@@ -2333,7 +2406,11 @@ class TrainingEnvAdapter:
             )
             planner_reservation_constraints: tuple[TruckReservationConstraint, ...] = ()
         else:
-            if not truck_replan_pressure and not require_station_backbone:
+            if (
+                not truck_replan_pressure
+                and not require_station_backbone
+                and not self._deferred_truck_plan_stops
+            ):
                 self._clear_truck_replan_pending()
             planning_orders = (
                 truck_mandatory_orders
@@ -2345,23 +2422,29 @@ class TrainingEnvAdapter:
                 truck_mandatory_orders=planning_orders,
                 require_station_backbone=require_station_backbone,
                 truck_route_ready_at=truck_route_ready_at,
+                truck_current_loc=(
+                    self._truck_position_at_time(truck_route_ready_at)
+                    if deferred_station_backbone_request
+                    else None
+                ),
             )
             planner_reservation_constraints = reservation_constraints
 
         trigger_ctx = self._build_planner_trigger_context(planner_runtime_state)
-        if (
-            require_station_backbone
-            or force_replan
-            or (
-                allow_truck_route_replan
-                and (self._truck_replan_pending or truck_replan_pressure)
-            )
+        forced_backlog_new_orders: int | None = None
+        if force_replan or (
+            allow_truck_route_replan
+            and (self._truck_replan_pending or truck_replan_pressure)
         ):
+            forced_backlog_new_orders = self._cfg.coarse_new_order_trigger
+        elif require_station_backbone:
+            forced_backlog_new_orders = _STATION_BACKBONE_DEFERRED_BACKLOG_NEW_ORDERS
+        if forced_backlog_new_orders is not None:
             trigger_ctx = PlannerTriggerContext(
                 t_now=trigger_ctx.t_now,
                 backlog_new_orders=max(
                     trigger_ctx.backlog_new_orders,
-                    self._cfg.coarse_new_order_trigger,
+                    int(forced_backlog_new_orders),
                 ),
                 fallback_count_in_window=trigger_ctx.fallback_count_in_window,
                 hard_failure_count_in_window=trigger_ctx.hard_failure_count_in_window,
@@ -2390,16 +2473,76 @@ class TrainingEnvAdapter:
                 ),
             }
         )
-        coarse_plan = self._planner_bridge.maybe_replan(
-            planner_runtime_state,
-            trigger_ctx,
-            reservation_constraints=planner_reservation_constraints,
-            allow_empty_backbone_route=(
-                self._allow_empty_backbone_route
-                or allow_tail_empty_backbone
-                or allow_deferred_empty_backbone
-            ),
+        planner_diag_enabled = bool(
+            require_station_backbone
+            or force_replan
+            or allow_truck_route_replan
+            or self._truck_replan_pending
+            or truck_replan_pressure
+            or planner_reservation_constraints
         )
+        if planner_diag_enabled:
+            logger.info(
+                "[ENV_DIAG] planner_maybe_replan start: t=%.3f current_plan=%s "
+                "require_station=%s force=%s allow_route_replan=%s replan_pending=%s "
+                "pressure=%s reservations=%d truck_mandatory=%d trigger_backlog=%d "
+                "route_drift=%.4f allow_empty=%s",
+                float(runtime_state.t_now),
+                (
+                    None
+                    if self._current_coarse_plan is None
+                    else int(self._current_coarse_plan.plan_version)
+                ),
+                bool(require_station_backbone),
+                bool(force_replan),
+                bool(allow_truck_route_replan),
+                bool(self._truck_replan_pending),
+                bool(truck_replan_pressure),
+                len(planner_reservation_constraints),
+                len(truck_mandatory_orders),
+                int(trigger_ctx.backlog_new_orders),
+                float(trigger_ctx.route_drift_ratio),
+                bool(
+                    self._allow_empty_backbone_route
+                    or allow_tail_empty_backbone
+                    or allow_deferred_empty_backbone
+                ),
+            )
+            planner_t0 = time.perf_counter()
+        allow_empty_backbone_route = (
+            self._allow_empty_backbone_route
+            or allow_tail_empty_backbone
+            or allow_deferred_empty_backbone
+        )
+        force_deferred_station_plan = bool(
+            require_station_backbone
+            and not allow_truck_route_replan
+        )
+        if force_deferred_station_plan:
+            coarse_plan = self._planner_bridge.replan_now(
+                planner_runtime_state,
+                trigger_ctx,
+                reservation_constraints=planner_reservation_constraints,
+                allow_empty_backbone_route=allow_empty_backbone_route,
+            )
+        else:
+            coarse_plan = self._planner_bridge.maybe_replan(
+                planner_runtime_state,
+                trigger_ctx,
+                reservation_constraints=planner_reservation_constraints,
+                allow_empty_backbone_route=allow_empty_backbone_route,
+            )
+        if planner_diag_enabled:
+            logger.info(
+                "[ENV_DIAG] planner_maybe_replan done: t=%.3f elapsed=%.3fs "
+                "returned_plan=%d truck_plan_stops=%d backbone=%d launch_stations=%d",
+                float(runtime_state.t_now),
+                time.perf_counter() - planner_t0,
+                int(coarse_plan.plan_version),
+                len(coarse_plan.truck_plan_stops),
+                len(coarse_plan.truck_backbone_route),
+                len(coarse_plan.launch_candidate_stations),
+            )
         self._append_debug_trace(
             {
                 "phase": "env_refresh_coarse_plan",
@@ -2435,9 +2578,27 @@ class TrainingEnvAdapter:
                             ),
                         }
                     )
-                    self._apply_dynamic_truck_plan(
+                    logger.info(
+                        "[ENV_DIAG] apply_dynamic_truck_plan start: t=%.3f "
+                        "truck_route_ready_at=%.3f truck_plan_stops=%d",
+                        float(runtime_state.t_now),
+                        float(truck_route_ready_at),
+                        len(coarse_plan.truck_plan_stops),
+                    )
+                    truck_plan_stops = self._filter_current_truck_plan_stops(
                         coarse_plan.truck_plan_stops,
+                        reason="apply_dynamic_truck_plan",
+                    )
+                    self._apply_dynamic_truck_plan(
+                        truck_plan_stops,
                         route_start_time=truck_route_ready_at,
+                    )
+                    logger.info(
+                        "[ENV_DIAG] apply_dynamic_truck_plan done: t=%.3f "
+                        "planned_route_stops=%d planned_segments=%d",
+                        float(runtime_state.t_now),
+                        len(self._planned_route_stops),
+                        len(self._planned_route_segments),
                     )
                     self._append_debug_trace(
                         {
@@ -2453,10 +2614,15 @@ class TrainingEnvAdapter:
                         }
                     )
                     applied_to_truck_route = True
+                    self._clear_deferred_truck_plan()
                     self._clear_truck_replan_pending()
                 else:
                     applied_to_truck_route = False
-                    self._mark_truck_replan_pending("truck_plan_deferred")
+                    self._store_deferred_truck_plan(coarse_plan)
+                    if self._deferred_truck_plan_stops:
+                        self._mark_truck_replan_pending("truck_plan_deferred")
+                    else:
+                        self._clear_truck_replan_pending()
             else:
                 applied_to_truck_route = False
             reservation_env_decisions = self._apply_planner_reservation_outcomes(
@@ -2510,6 +2676,10 @@ class TrainingEnvAdapter:
             return False
 
         if self._planner_bridge is not None:
+            if self._deferred_truck_plan_satisfies_future_backbone(
+                float(runtime_state.t_now)
+            ):
+                return False
             self._mark_truck_replan_pending("future_backbone_capacity")
             return True
 
@@ -2626,7 +2796,79 @@ class TrainingEnvAdapter:
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons.clear()
 
-    def _truck_route_ready_time_for_replan(self, t_now: float) -> float:
+    def _clear_deferred_truck_plan(self) -> None:
+        self._deferred_truck_plan_stops = ()
+        self._deferred_truck_plan_version = None
+
+    def _store_deferred_truck_plan(self, coarse_plan: CoarsePlanView) -> None:
+        truck_plan_stops = self._filter_current_truck_plan_stops(
+            coarse_plan.truck_plan_stops,
+            reason="store_deferred_truck_plan",
+        )
+        self._deferred_truck_plan_stops = truck_plan_stops
+        self._deferred_truck_plan_version = (
+            int(coarse_plan.plan_version) if truck_plan_stops else None
+        )
+
+    def _filter_current_truck_plan_stops(
+        self,
+        truck_plan_stops: tuple[TruckPlanStopView, ...],
+        *,
+        reason: str,
+    ) -> tuple[TruckPlanStopView, ...]:
+        kept: list[TruckPlanStopView] = []
+        removed_customer_orders: list[str] = []
+        for stop in truck_plan_stops:
+            if self._is_current_truck_plan_stop(stop):
+                kept.append(stop)
+            elif stop.node_type == "customer" and stop.order_id:
+                removed_customer_orders.append(str(stop.order_id))
+
+        if removed_customer_orders:
+            self._append_debug_trace(
+                {
+                    "phase": "env_refresh_coarse_plan",
+                    "phase_step": "filter_stale_truck_plan_stops",
+                    "reason": str(reason),
+                    "t_now": float(self._t_now),
+                    "input_stop_count": len(truck_plan_stops),
+                    "kept_stop_count": len(kept),
+                    "removed_customer_order_ids": tuple(removed_customer_orders),
+                }
+            )
+        return tuple(kept)
+
+    def _is_current_truck_plan_stop(self, stop: TruckPlanStopView) -> bool:
+        if stop.node_type != "customer":
+            return True
+        order_id = str(stop.order_id or "")
+        if not order_id:
+            return False
+
+        order_mgr = self._require_order_manager()
+        if order_id in order_mgr.pending_orders:
+            return True
+        if order_id in order_mgr.assigned_orders:
+            return True
+        if order_id in self._background_mode_a_pending:
+            return order_id in self._static_truck_only_orders()
+        return False
+
+    def _deferred_truck_plan_satisfies_future_backbone(self, t_now: float) -> bool:
+        station_count = sum(
+            1
+            for stop in self._deferred_truck_plan_stops
+            if stop.node_type == "station"
+            and float(stop.arrival_time) > float(t_now) + _TIME_EPS
+        )
+        return station_count >= _MIN_FUTURE_STATION_BACKBONE_VISITS
+
+    def _truck_route_ready_time_for_replan(
+        self,
+        t_now: float,
+        *,
+        defer_until_next_stop: bool = False,
+    ) -> float:
         """返回卡车完成当前 stop 服务、可驶向新计划首站的时刻。"""
         current_stop_idx = int(self._planned_route_stop_i) - 1
         if 0 <= current_stop_idx < len(self._planned_route_stops):
@@ -2636,6 +2878,11 @@ class TrainingEnvAdapter:
                 and float(stop.departure_time) > float(t_now) + _TIME_EPS
             ):
                 return float(stop.departure_time)
+        if defer_until_next_stop:
+            next_stop_idx = int(self._planned_route_stop_i)
+            if 0 <= next_stop_idx < len(self._planned_route_stops):
+                next_stop = self._planned_route_stops[next_stop_idx]
+                return max(float(t_now), float(next_stop.departure_time))
         return float(t_now)
 
     def _build_coarse_only_runtime_state(
@@ -2658,11 +2905,16 @@ class TrainingEnvAdapter:
         truck_mandatory_orders: Mapping[str, Order],
         require_station_backbone: bool = False,
         truck_route_ready_at: float | None = None,
+        truck_current_loc: Position3D | None = None,
     ) -> PlannerRuntimeStateView:
         """构造 PlannerBridge 专用输入，显式区分 PPO pending 与卡车必经订单。"""
         return PlannerRuntimeStateView(
             t_now=float(runtime_state.t_now),
-            truck_current_loc=_clone_position(runtime_state.truck_current_loc),
+            truck_current_loc=_clone_position(
+                runtime_state.truck_current_loc
+                if truck_current_loc is None
+                else truck_current_loc
+            ),
             drone_states=runtime_state.drone_states,
             pending_orders=runtime_state.pending_orders,
             assigned_orders=runtime_state.assigned_orders,
@@ -2673,7 +2925,23 @@ class TrainingEnvAdapter:
             truck_route_ready_at=(
                 None if truck_route_ready_at is None else float(truck_route_ready_at)
             ),
+            recent_truck_station_ids=self._recent_truck_station_ids(
+                float(runtime_state.t_now)
+                if truck_route_ready_at is None
+                else float(truck_route_ready_at)
+            ),
         )
+
+    def _recent_truck_station_ids(self, t_ref: float, *, limit: int = 6) -> tuple[str, ...]:
+        station_ids = [
+            str(stop.node_id)
+            for stop in self._planned_route_stops
+            if stop.node_type == "station"
+            and float(stop.arrival_time) <= float(t_ref) + _TIME_EPS
+        ]
+        if limit <= 0:
+            return ()
+        return tuple(station_ids[-int(limit):])
 
     def _build_truck_mandatory_order_input(
         self,
@@ -3196,14 +3464,17 @@ class TrainingEnvAdapter:
         effective_route_start_time = float(
             self._t_now if route_start_time is None else route_start_time
         )
-        anchor = PlannedStop(
-            seq=0,
-            node_type="truck_current",
-            node_id="truck_current",
-            position=self._truck_position_at_time(self._t_now),
-            order_id=None,
-            arrival_time=float(self._t_now),
-            departure_time=effective_route_start_time,
+        logger.info(
+            "[TRUCK_ROUTE_DIAG] dynamic_plan start: t=%.3f route_start=%.3f "
+            "truck_plan_stops=%d current_pos=(%.2f, %.2f)",
+            float(self._t_now),
+            effective_route_start_time,
+            len(truck_plan_stops),
+            float(self._truck_position_at_time(self._t_now).x),
+            float(self._truck_position_at_time(self._t_now).y),
+        )
+        anchor = self._dynamic_truck_plan_anchor_stop(
+            route_start_time=effective_route_start_time
         )
         planned_stops = [anchor]
         planned_segments: list[PlannedTruckSegment] = []
@@ -3219,12 +3490,36 @@ class TrainingEnvAdapter:
                 arrival_time=float(stop_view.arrival_time),
                 departure_time=float(stop_view.departure_time),
             )
+            segment_t0 = time.perf_counter()
+            logger.info(
+                "[TRUCK_ROUTE_DIAG] segment start: idx=%d/%d from=%s(%s) "
+                "to=%s(%s) arr=%.3f dep=%.3f",
+                idx,
+                len(truck_plan_stops),
+                str(prev_stop.node_id),
+                str(prev_stop.node_type),
+                str(planned_stop.node_id),
+                str(planned_stop.node_type),
+                float(planned_stop.arrival_time),
+                float(planned_stop.departure_time),
+            )
             route = self._build_truck_road_route(
                 from_pos=prev_stop.position,
                 to_pos=position,
             )
             geometry = route.geometry
             distance_m = _polyline_distance_2d(geometry)
+            logger.info(
+                "[TRUCK_ROUTE_DIAG] segment done: idx=%d/%d to=%s elapsed=%.3fs "
+                "geometry_points=%d osm_nodes=%d distance_m=%.1f",
+                idx,
+                len(truck_plan_stops),
+                str(planned_stop.node_id),
+                time.perf_counter() - segment_t0,
+                len(geometry),
+                len(route.osm_node_path),
+                float(distance_m),
+            )
             planned_segments.append(
                 PlannedTruckSegment(
                     segment_id=len(planned_segments),
@@ -3256,9 +3551,65 @@ class TrainingEnvAdapter:
             if stop.node_type in {"station", "depot"}
         ]
         self._truck_route_version += 1
+        patrol_t0 = time.perf_counter()
+        logger.info(
+            "[TRUCK_ROUTE_DIAG] patrol_append start: t=%.3f planned_stops_before=%d",
+            float(self._t_now),
+            len(self._planned_route_stops),
+        )
         self._append_patrol_loop_if_needed()
+        logger.info(
+            "[TRUCK_ROUTE_DIAG] patrol_append done: t=%.3f elapsed=%.3fs "
+            "planned_stops_after=%d segments_after=%d",
+            float(self._t_now),
+            time.perf_counter() - patrol_t0,
+            len(self._planned_route_stops),
+            len(self._planned_route_segments),
+        )
         if len(self._planned_route_stops) >= 2:
+            bind_t0 = time.perf_counter()
+            logger.info(
+                "[TRUCK_ROUTE_DIAG] bind_route start: route_nodes=%d route_segments=%d",
+                len(self._planned_route_stops),
+                len(self._planned_route_segments),
+            )
             self._bind_truck_route()
+            logger.info(
+                "[TRUCK_ROUTE_DIAG] bind_route done: elapsed=%.3fs",
+                time.perf_counter() - bind_t0,
+            )
+
+    def _dynamic_truck_plan_anchor_stop(self, *, route_start_time: float) -> PlannedStop:
+        current_stop_idx = int(self._planned_route_stop_i) - 1
+        if 0 <= current_stop_idx < len(self._planned_route_stops):
+            stop = self._planned_route_stops[current_stop_idx]
+            if (
+                stop.arrival_time <= self._t_now + _TIME_EPS
+                and self._t_now <= stop.departure_time + _TIME_EPS
+                and stop.node_type in {"customer", "station", "depot"}
+            ):
+                return PlannedStop(
+                    seq=0,
+                    node_type=stop.node_type,
+                    node_id=stop.node_id,
+                    position=_clone_position(stop.position),
+                    order_id=stop.order_id,
+                    arrival_time=float(stop.arrival_time),
+                    departure_time=max(
+                        float(stop.departure_time),
+                        float(route_start_time),
+                    ),
+                )
+
+        return PlannedStop(
+            seq=0,
+            node_type="truck_current",
+            node_id="truck_current",
+            position=self._truck_position_at_time(self._t_now),
+            order_id=None,
+            arrival_time=float(self._t_now),
+            departure_time=float(route_start_time),
+        )
 
     def _resolve_truck_plan_stop_position(
         self,
@@ -4259,10 +4610,42 @@ class TrainingEnvAdapter:
                 **self._build_done_condition_debug(),
             }
         )
+        refresh_diag_enabled = bool(
+            truck_stop_at_event_time
+            or self._truck_replan_pending
+            or self._truck_replan_pending_reasons
+        )
+        if refresh_diag_enabled:
+            logger.info(
+                "[ENV_DIAG] refresh_coarse_plan start: t=%.3f truck_stop=%s "
+                "truck_stop_count=%d station_arrivals=%s replan_pending=%s reasons=%s",
+                float(self._t_now),
+                bool(truck_stop_at_event_time),
+                len(truck_stops),
+                [str(stop.node_id) for stop in station_arrivals],
+                bool(self._truck_replan_pending),
+                sorted(str(reason) for reason in self._truck_replan_pending_reasons),
+            )
+            refresh_t0 = time.perf_counter()
         self._refresh_coarse_plan_if_needed(
             refreshed_runtime_state,
             allow_truck_route_replan=truck_stop_at_event_time,
         )
+        if refresh_diag_enabled:
+            logger.info(
+                "[ENV_DIAG] refresh_coarse_plan done: t=%.3f elapsed=%.3fs "
+                "decision_queue_len=%d current_plan_version=%s replan_pending=%s reasons=%s",
+                float(self._t_now),
+                time.perf_counter() - refresh_t0,
+                len(self._decision_queue),
+                (
+                    None
+                    if self._current_coarse_plan is None
+                    else int(self._current_coarse_plan.plan_version)
+                ),
+                bool(self._truck_replan_pending),
+                sorted(str(reason) for reason in self._truck_replan_pending_reasons),
+            )
         self._append_debug_trace(
             {
                 "phase": "env_advance_to_event",
@@ -6636,7 +7019,11 @@ class TrainingEnvAdapter:
         truck.set_route(
             route_nodes=route_nodes,
             route_positions=route_positions,
-            departure_time=0.0,
+            departure_time=(
+                float(self._planned_route_segments[0].start_time)
+                if self._planned_route_segments
+                else float(self._t_now)
+            ),
             geometry=geometry if len(geometry) >= 2 else None,
         )
 

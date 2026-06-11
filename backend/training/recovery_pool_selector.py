@@ -20,10 +20,10 @@ def select_recovery_pool_for_order(
     drone_cruise_speed: float,
     upper_horizon_sec: float,
 ) -> tuple[str, ...]:
-    """Expose fixed nodes that the truck will still visit.
+    """Expose station handoff nodes that the truck will still visit.
 
     The coarse layer keeps a small deterministic pool per order:
-      1. scan the near-future truck backbone up to ``future_scan_limit`` valid nodes;
+      1. scan the near-future station backbone up to ``future_scan_limit`` valid nodes;
       2. sort by delivery-to-recovery distance, then ETA and route order;
       3. keep at most ``max_candidates`` nodes.
 

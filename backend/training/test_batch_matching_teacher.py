@@ -276,7 +276,7 @@ class TestBatchMatchingTeacher(unittest.TestCase):
             result.actions_by_drone["DRN-1"],
             DispatchAction("ORDER-1", "C"),
         )
-        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, 86.0)
+        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, 77.0)
 
     def test_local_teacher_competition_hints_are_pre_matching(self) -> None:
         runtime_state = object()

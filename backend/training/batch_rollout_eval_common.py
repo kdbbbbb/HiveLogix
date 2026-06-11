@@ -327,6 +327,10 @@ def print_summary(summary: Mapping[str, Any]) -> None:
         "sum_episode_uav_energy_reward_penalty",
         "sum_episode_uav_energy_ratio_sum",
         "sum_episode_uav_energy_penalty_events",
+        "sum_truck_energy_kwh",
+        "sum_uav_energy_kwh",
+        "sum_total_energy_cost_kwh",
+        "mean_total_energy_cost_kwh",
         "script_selected_C_given_legal_C",
         "episode_metrics_path",
     ]

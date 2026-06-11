@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -146,7 +147,24 @@ class TrainingUavPathService:
             path = [_clone_position(from_pos), _clone_position(to_pos)]
         else:
             try:
+                plan_t0 = time.perf_counter()
+                logger.info(
+                    "[UAV_PATH_DIAG] plan_path start: from=(%.2f, %.2f, %.1f) "
+                    "to=(%.2f, %.2f, %.1f) altitude=%.1f",
+                    float(from_pos.x),
+                    float(from_pos.y),
+                    float(from_pos.z),
+                    float(to_pos.x),
+                    float(to_pos.y),
+                    float(to_pos.z),
+                    float(effective_altitude),
+                )
                 planned = self._planner.plan(from_pos, to_pos, effective_altitude)
+                logger.info(
+                    "[UAV_PATH_DIAG] plan_path done: elapsed=%.3fs points=%d",
+                    time.perf_counter() - plan_t0,
+                    len(planned),
+                )
             except Exception:
                 logger.exception(
                     "[TrainingUavPathService] UAV path planning failed; "

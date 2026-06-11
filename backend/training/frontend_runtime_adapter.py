@@ -62,6 +62,10 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+_MODULE_PATH = Path(__file__).resolve()
+_BACKEND_ROOT = _MODULE_PATH.parents[1]
+_PROJECT_ROOT = _BACKEND_ROOT.parent
+
 _TICK_INTERVAL_SEC = 0.1
 _MIN_SPEED_RATIO = 1e-3
 _MAX_ORDER_LIMIT = 500
@@ -72,6 +76,27 @@ _HOME_DISTANCE_TOLERANCE_M = 5.0
 DECISION_PENDING = "DECISION_PENDING"
 DECISION_APPLIED = "DECISION_APPLIED"
 EXECUTION_HARD_FAILED = "EXECUTION_HARD_FAILED"
+
+
+def _resolve_activation_path(raw_path: str | Path) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    candidates = [
+        Path.cwd() / path,
+        _PROJECT_ROOT / path,
+        _BACKEND_ROOT / path,
+    ]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+    return (Path.cwd() / path).resolve()
 
 _TRAINING_TO_FRONTEND_DRONE_STATUS: Mapping[str, str] = {
     "idle": "IDLE",
@@ -898,10 +923,44 @@ class OnlinePolicyRuntimePlayer:
 
     def _apply_policy_once_locked(self, *, env: TrainingEnvAdapter, decision_context: Any) -> None:
         drone_id = str(decision_context.deciding_drone_id)
+        decision_t0 = time.perf_counter()
+        runtime_state = getattr(decision_context, "runtime_state", None)
+        pending_orders = getattr(runtime_state, "pending_orders", {}) or {}
+        assigned_orders = getattr(runtime_state, "assigned_orders", {}) or {}
+        logger.info(
+            "[PPO_DIAG] decision start: t=%.3f drone=%s trigger=%s station=%s "
+            "plan_version=%s pending=%d assigned=%d action_lookup_snapshot=%d",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+            str(getattr(decision_context, "trigger_type", "")),
+            getattr(decision_context, "trigger_station_id", None),
+            getattr(getattr(decision_context, "coarse_plan", None), "plan_version", None),
+            len(pending_orders),
+            len(assigned_orders),
+            len(tuple(getattr(decision_context, "action_lookup", ()) or ())),
+        )
+        candidate_t0 = time.perf_counter()
+        logger.info(
+            "[PPO_DIAG] candidate_build start: t=%.3f drone=%s trigger=%s station=%s",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+            str(getattr(decision_context, "trigger_type", "")),
+            getattr(decision_context, "trigger_station_id", None),
+        )
         candidate_out = _build_candidate_output(
             env=env,
             decision_context=decision_context,
             last_seen_plan_version_by_drone=self._last_seen_plan_version_by_drone,
+        )
+        logger.info(
+            "[PPO_DIAG] candidate_build done: t=%.3f drone=%s elapsed=%.3fs "
+            "orders=%d actions=%d has_wait=%s",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+            time.perf_counter() - candidate_t0,
+            sum(1 for value in tuple(getattr(candidate_out, "order_mask", ()) or ()) if value),
+            len(tuple(candidate_out.resolved_action_lookup.as_action_lookup())),
+            bool(getattr(candidate_out, "has_wait_action", False)),
         )
         decision_start_wall_ms = int(time.time() * 1000)
         self._append_decision_event(
@@ -925,6 +984,12 @@ class OnlinePolicyRuntimePlayer:
             decision_context=decision_context,
             critic_tensor_schema_meta=self._runtime.critic_schema,
         )
+        model_t0 = time.perf_counter()
+        logger.info(
+            "[PPO_DIAG] model_forward start: t=%.3f drone=%s",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+        )
         with torch.no_grad():
             policy_out, next_lstm_state = self._runtime.model.forward(
                 observation_batch=observation_batch,
@@ -937,6 +1002,12 @@ class OnlinePolicyRuntimePlayer:
                 action_mask=action_mask,
                 deterministic=self._activation.deterministic,
             )
+        logger.info(
+            "[PPO_DIAG] model_forward done: t=%.3f drone=%s elapsed=%.3fs",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+            time.perf_counter() - model_t0,
+        )
         decision_finish_wall_ms = int(time.time() * 1000)
         action_indices = ResolvedActionIndices(**sampled_action)
         env_action = candidate_out.resolved_action_lookup.resolve(
@@ -948,7 +1019,27 @@ class OnlinePolicyRuntimePlayer:
                 None if action_indices.mode_idx is None else int(action_indices.mode_idx)
             ),
         )
+        apply_t0 = time.perf_counter()
+        logger.info(
+            "[PPO_DIAG] apply_decision start: t=%.3f drone=%s action=%s order=%s mode=%s",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+            type(env_action).__name__,
+            getattr(env_action, "order_id", None),
+            getattr(env_action, "mode", None),
+        )
         step_result = env.apply_decision(env_action)
+        logger.info(
+            "[PPO_DIAG] apply_decision done: t=%.3f drone=%s elapsed=%.3fs "
+            "next_t=%.3f next_has_decision=%s done=%s total_decision_elapsed=%.3fs",
+            float(getattr(decision_context, "t_decision", 0.0)),
+            drone_id,
+            time.perf_counter() - apply_t0,
+            float(getattr(getattr(step_result, "runtime_state", None), "t_now", 0.0)),
+            getattr(step_result, "decision_context", None) is not None,
+            bool(getattr(step_result, "done", False)),
+            time.perf_counter() - decision_t0,
+        )
         applied_event_seq = self._append_decision_event(
             decision_context=decision_context,
             candidate_out=candidate_out,
@@ -1230,8 +1321,8 @@ def build_policy_activation_config(payload: Mapping[str, Any]) -> PolicyActivati
 
     return PolicyActivationConfig(
         policy_name=str(payload.get("policy_name", "rh_alns_cmrappo")).strip() or "rh_alns_cmrappo",
-        policy_path=Path(policy_path_raw).resolve(),
-        config_path=Path(config_path_raw).resolve(),
+        policy_path=_resolve_activation_path(policy_path_raw),
+        config_path=_resolve_activation_path(config_path_raw),
         scene_id=str(payload.get("scene_id", "")).strip(),
         scene_bundle_dir=(
             None

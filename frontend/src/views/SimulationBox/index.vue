@@ -381,7 +381,7 @@
           <div class="sc-policy-grid">
             <label class="sc-policy-field">
               <span>策略权重路径</span>
-              <input v-model="policyPath" type="text" placeholder="weights/.../policy_best.pt" />
+              <input v-model="policyPath" type="text" placeholder="backend/config/policy_last.pt" />
             </label>
             <label class="sc-policy-field">
               <span>配置文件路径</span>
@@ -494,7 +494,7 @@ const initDone    = ref(false)
 type PolicyOrderSourceMode = 'benchmark' | 'poisson' | 'hybrid'
 const PPO_SCENE_ID = 'default_test_4x4km'
 const policyLoading = ref(false)
-const policyPath = ref('config/policy_best.pt')
+const policyPath = ref('backend/config/policy_last.pt')
 const policyConfigPath = ref('config/rh_alns_cmrappo.yaml')
 const policySceneId = ref(PPO_SCENE_ID)
 const policyDeterministic = ref(true)

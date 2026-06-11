@@ -159,7 +159,7 @@ planner:
   #   launch_candidate_stations=()
   #   policy_mode_mask 收缩为 {B}
   # 默认保持严格契约，空骨架仍视为错误。
-  allow_empty_backbone_route: false
+  allow_empty_backbone_route: true
 
   # WAIT 动作推进量上限（idle 状态下）。
   # 防止极长空窗把一次 WAIT 的 T_idle 惩罚拉得过大，影响训练稳定性。
@@ -175,6 +175,17 @@ planner:
   # 只要 station 位于卡车未来骨架，到站即触发车载 UAV 决策。
   support_radius_km: 1.2
   min_orders_to_trigger: 1
+  # station coverage 打分：
+  # - recovery_opportunity_bonus_sec：单个 pending UAV 订单对站点 Mode C recovery 的
+  #   基础时空价值，继续作为绕路时间抵扣项。
+  # - station_density_bonus_sec：新增覆盖订单数量占比的最高额外抵扣秒数；
+  #   只统计尚未被已选站点覆盖的订单簇，避免短距离相邻站反复吃同一批订单。
+  # - station_overlap_discount_ratio：已选站点覆盖同一订单簇时，对后续相邻站
+  #   recovery opportunity 的折扣强度。
+  recovery_opportunity_bonus_sec: 90.0
+  recovery_opportunity_bonus_cap_sec: 360.0
+  station_density_bonus_sec: 45.0
+  station_overlap_discount_ratio: 0.65
 
 candidate:
   # 对 4×4km / 10 站点规模，32 个订单候选已足以覆盖单轮局部决策的高价值区域，
@@ -309,7 +320,7 @@ reward:
   # 但仍保持显著低于 Run09 的 reward scale。
   rendezvous_arrive_bonus: 8.0
   rendezvous_bonus: 20.0
-  mode_c_attempt_bonus: 5.0
+  mode_c_attempt_bonus: 3.0
   uav_energy_penalty_coef: 10.0
   uav_energy_penalty_cap_ratio: 0.35
 
@@ -356,7 +367,7 @@ training:
   reward_scale: 0.01
   # Mode C shaping bonus 使用训练尺度固定值，不再依赖原始 reward 经过 reward_scale 缩放。
   # rendezvous_arrive_bonus_scaled 保留为旧配置兼容字段，当前训练逻辑不再使用。
-  mode_c_attempt_bonus_scaled: 0.07
+  mode_c_attempt_bonus_scaled: 0.03
   rendezvous_arrive_bonus_scaled: 0.30
   rendezvous_bonus_scaled: 0.80
   # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
@@ -405,9 +416,8 @@ training:
   # 或通过 bc_warm_start_checkpoint_path 显式指定已有 warmup 产物。
   bc_warm_start_reuse_existing: false
   bc_warm_start_checkpoint_interval_updates: 10
-  # Convergence fine-tune: 通过现有 checkpoint loader 加载 poisson96 的 30k policy，
-  # 从已训练策略继续 fine-tune，而不是从 BC 起点重新跑 PPO。
-  bc_warm_start_checkpoint_path: "backend/runs/ppo_train/poisson_two_stage_warmup96_formal_30k_ddl_sorted/policy.pt"
+  # 本轮重新 warmup：必须保持为空，避免显式加载旧 policy.pt 跳过 BC warm start。
+  bc_warm_start_checkpoint_path: ""
   # BC 专用监督损失权重；跳过 forced WAIT，强化 wait-with-dispatch，C 权重略降避免继续压制 order/B 学习。
   bc_wait_no_dispatch_loss_weight: 0.0
   bc_wait_with_dispatch_loss_weight: 1.00

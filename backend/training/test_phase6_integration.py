@@ -32,6 +32,7 @@ from .contracts import (
     ReservationPlanOutcome,
     ReservationPlanStatus,
     RouteDriftRef,
+    TruckPlanStopView,
     TruckReservationConstraint,
 )
 from .env_adapter import (
@@ -476,6 +477,7 @@ class TestPhase6Integration(unittest.TestCase):
         entity_mgr = env._require_entity_manager()
         station_ids = sorted(entity_mgr.stations)
         self.assertGreaterEqual(len(station_ids), 5)
+        depot = env._require_depot()
 
         preferred_station_id = station_ids[4]
         preferred_station = entity_mgr.stations[preferred_station_id]
@@ -494,6 +496,12 @@ class TestPhase6Integration(unittest.TestCase):
             station.wait_queue = [f"wait-{station_id}"]
 
         env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=env._t_now + 30.0,
+                departure_time=env._t_now + 30.0 + 1e-6,
+            )
+        ] + [
             BackboneVisit(
                 node_id=station_id,
                 arrival_time=env._t_now + 60.0 * (idx + 1),
@@ -516,6 +524,9 @@ class TestPhase6Integration(unittest.TestCase):
         )
         recovery_nodes = coarse_plan.recovery_pool[order.order_id]
 
+        self.assertNotIn(depot.depot_id, coarse_plan.truck_backbone_route)
+        self.assertNotIn(depot.depot_id, coarse_plan.truck_eta_map)
+        self.assertNotIn(depot.depot_id, recovery_nodes)
         self.assertLessEqual(
             len(recovery_nodes),
             env._cfg.max_candidate_recovery_per_order,
@@ -545,6 +556,19 @@ class TestPhase6Integration(unittest.TestCase):
                     route_drift_ratio=0.0,
                 ),
             )
+
+    def test_poisson_reset_respects_config_allow_empty_backbone(self) -> None:
+        config_path = Path(
+            "backend/config/"
+            "rh_alns_cmrappo_bc_warm_start_poisson_two_stage_formal_30k_ddl_sorted.yaml"
+        )
+        env = TrainingEnvAdapter(config_path=config_path)
+
+        env.reset()
+
+        self.assertTrue(env._cfg.allow_empty_backbone_route)
+        self.assertTrue(env._allow_empty_backbone_route)
+        self.assertTrue(env._planner_bridge._runtime_allow_empty_backbone_route)
 
     def test_benchmark_planner_bridge_allows_empty_backbone(self) -> None:
         scene_ctx = load_default_scene()
@@ -1677,6 +1701,129 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertTrue(env._truck_replan_pending)
         self.assertIn("future_backbone_capacity", env._truck_replan_pending_reasons)
 
+    def test_future_station_capacity_uses_single_deferred_truck_plan(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 3)
+        depot = env._require_depot()
+        drone = entity_mgr.drones[drone_id]
+        t_now = 100.0
+        env._t_now = t_now
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-DEFERRED-STATION-BACKBONE",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_ids[0],
+                arrival_time=t_now + 60.0,
+                departure_time=t_now + 60.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_ids[1],
+                arrival_time=t_now + 120.0,
+                departure_time=t_now + 120.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=t_now + 180.0,
+                departure_time=t_now + 180.0 + 1e-6,
+            ),
+        ]
+        env._planner_bridge.reset_episode(allow_empty_backbone_route=False)
+        env._current_coarse_plan = None
+        initial_route_version = env._truck_route_version
+
+        deferred_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=False,
+        )
+
+        self.assertTrue(env._deferred_truck_plan_stops)
+        self.assertEqual(
+            env._planner_replan_events[-1]["trigger"]["backlog_new_orders"],
+            2,
+        )
+        self.assertFalse(env._planner_replan_events[-1]["applied_to_truck_route"])
+        self.assertEqual(env._truck_route_version, initial_route_version)
+        event_count = len(env._planner_replan_events)
+        plan_version = deferred_plan.plan_version
+
+        env._t_now = t_now + 1.0
+        waiting_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=False,
+        )
+
+        self.assertEqual(waiting_plan.plan_version, plan_version)
+        self.assertEqual(len(env._planner_replan_events), event_count)
+        self.assertTrue(env._deferred_truck_plan_stops)
+
+        next_stop_idx = env._planned_route_stop_i
+        self.assertLess(next_stop_idx, len(env._planned_route_stops))
+        next_stop = env._planned_route_stops[next_stop_idx]
+        env._t_now = float(next_stop.arrival_time)
+        env._require_truck().current_loc = next_stop.position
+        env._planned_route_stop_i = next_stop_idx + 1
+
+        env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=True,
+        )
+
+        self.assertFalse(env._deferred_truck_plan_stops)
+        self.assertFalse(env._truck_replan_pending)
+        self.assertGreater(env._truck_route_version, initial_route_version)
+        self.assertEqual(env._planned_route_stops[0].node_id, next_stop.node_id)
+        self.assertAlmostEqual(
+            env._planned_route_segments[0].start_time,
+            next_stop.departure_time,
+            places=6,
+        )
+        bound_truck_loc = env._require_truck().get_location(float(next_stop.arrival_time))
+        self.assertLess(bound_truck_loc.distance_2d(next_stop.position), 1.0)
+
+    def test_stale_background_customer_stop_is_filtered_from_deferred_plan(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        stale_order_id = "ORD-STATIC-STALE"
+        station_id = sorted(env._require_entity_manager().stations)[0]
+
+        env._background_mode_a_completed.add(stale_order_id)
+
+        stale_customer_stop = TruckPlanStopView(
+            seq=1,
+            node_type="customer",
+            node_id=stale_order_id,
+            order_id=stale_order_id,
+            arrival_time=100.0,
+            departure_time=101.0,
+        )
+        station_stop = TruckPlanStopView(
+            seq=2,
+            node_type="station",
+            node_id=station_id,
+            order_id=None,
+            arrival_time=200.0,
+            departure_time=201.0,
+        )
+
+        filtered = env._filter_current_truck_plan_stops(
+            (stale_customer_stop, station_stop),
+            reason="test",
+        )
+
+        self.assertEqual(filtered, (station_stop,))
+        self.assertNotIn(stale_order_id, env._background_mode_a_pending)
+        self.assertIn(stale_order_id, env._background_mode_a_completed)
+
     def test_truck_replan_after_station_arrival_starts_after_current_stop_service(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
@@ -1761,6 +1908,17 @@ class TestPhase6Integration(unittest.TestCase):
             env._planned_route_segments[0].start_time,
             service_finish,
             places=6,
+        )
+        self.assertEqual(env._planned_route_stops[0].node_id, current_station.station_id)
+        self.assertLess(
+            truck.get_location(t_now).distance_2d(current_station.location),
+            1.0,
+        )
+        self.assertLess(
+            truck.get_location(service_finish - 1.0).distance_2d(
+                current_station.location
+            ),
+            1.0,
         )
 
     def test_deferred_truck_replan_allows_temporary_empty_backbone(self) -> None:

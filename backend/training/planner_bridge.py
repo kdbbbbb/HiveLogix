@@ -33,8 +33,12 @@ from .scene_loader import DEFAULT_CONFIG_PATH
 
 _TIME_EPS = 1e-6
 _EXACT_ROUTE_SEARCH_MAX_NODES = 8
+_TRUCK_TRAVEL_TIME_CACHE_MAX_ENTRIES = 50000
 _RECOVERY_OPPORTUNITY_BONUS_SEC = 90.0
 _RECOVERY_OPPORTUNITY_BONUS_CAP_SEC = 360.0
+_STATION_DENSITY_BONUS_SEC = 45.0
+_STATION_OVERLAP_DISCOUNT_RATIO = 0.65
+_STATION_ANTI_PINGPONG_MIN_GAP = 3
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,10 @@ class _PlannerConfig:
     rendezvous_max_wait_sec: float
     allow_empty_backbone_route: bool
     beam_width: int
+    recovery_opportunity_bonus_sec: float
+    recovery_opportunity_bonus_cap_sec: float
+    station_density_bonus_sec: float
+    station_overlap_discount_ratio: float
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,14 @@ class PlannerBridge:
             self._cfg.allow_empty_backbone_route
         )
         self._current_plan: CoarsePlanView | None = None
+        self._truck_travel_time_cache: dict[
+            tuple[
+                tuple[float, float, float],
+                tuple[float, float, float],
+                float,
+            ],
+            float,
+        ] = {}
 
     @property
     def current_plan(self) -> CoarsePlanView | None:
@@ -168,6 +184,28 @@ class PlannerBridge:
         )
         return self._current_plan
 
+    def replan_now(
+        self,
+        runtime_state: Any,
+        trigger_ctx: PlannerTriggerContext,
+        reservation_constraints: Sequence[TruckReservationConstraint] = (),
+        allow_empty_backbone_route: bool | None = None,
+    ) -> CoarsePlanView:
+        """立即生成一版 coarse plan，用于环境侧一次性 deferred 路线请求。"""
+        plan_version = (
+            0
+            if self._current_plan is None
+            else self._current_plan.plan_version + 1
+        )
+        self._current_plan = self._build_plan(
+            runtime_state=runtime_state,
+            t_now=float(trigger_ctx.t_now),
+            plan_version=plan_version,
+            reservation_constraints=reservation_constraints,
+            allow_empty_backbone_route=allow_empty_backbone_route,
+        )
+        return self._current_plan
+
     def _should_replan(self, trigger_ctx: PlannerTriggerContext) -> bool:
         assert self._current_plan is not None
         if trigger_ctx.t_now >= self._current_plan.valid_until - _TIME_EPS:
@@ -206,9 +244,12 @@ class PlannerBridge:
             baseline_visits=future_visits,
             reservation_constraints=reservation_constraints,
         )
-        plan_fixed_visits = self._visits_from_truck_plan_stops(
+        plan_fixed_visits = self._handoff_visits_from_truck_plan_stops(
             truck_plan_stops
-        ) or future_visits
+        ) or self._station_handoff_visits(
+            future_visits,
+            runtime_state=runtime_state,
+        )
         truck_backbone_route = tuple(visit.node_id for visit in plan_fixed_visits)
         effective_allow_empty_backbone_route = (
             self._runtime_allow_empty_backbone_route
@@ -354,6 +395,9 @@ class PlannerBridge:
 
         start_pos = runtime_state.truck_current_loc
         truck_speed = self._resolve_truck_speed_mps()
+        reservation_windows_by_node = self._reservation_windows_by_node(
+            reservation_constraints
+        )
         truck_route_ready_at = float(
             getattr(runtime_state, "truck_route_ready_at", None) or t_now
         )
@@ -363,6 +407,7 @@ class PlannerBridge:
                 start_time=truck_route_ready_at,
                 mandatory_nodes=mandatory_nodes,
                 reservation_constraints=reservation_constraints,
+                reservation_windows_by_node=reservation_windows_by_node,
                 truck_speed=truck_speed,
             )
             if best is None:
@@ -378,6 +423,11 @@ class PlannerBridge:
                 baseline_visits=baseline_visits,
                 selected_nodes={node.node_id for node in base_nodes},
             )
+            if not coverage_nodes:
+                coverage_nodes = self._select_station_backbone_nodes(
+                    runtime_state=runtime_state,
+                    selected_nodes={node.node_id for node in base_nodes},
+                )
             nodes = self._append_station_coverage(
                 runtime_state=runtime_state,
                 base_nodes=base_nodes,
@@ -386,6 +436,7 @@ class PlannerBridge:
                 start_pos=start_pos,
                 start_time=truck_route_ready_at,
                 reservation_constraints=reservation_constraints,
+                reservation_windows_by_node=reservation_windows_by_node,
                 truck_speed=truck_speed,
             )
         elif require_station_backbone:
@@ -401,6 +452,7 @@ class PlannerBridge:
                 start_pos=start_pos,
                 start_time=truck_route_ready_at,
                 reservation_constraints=reservation_constraints,
+                reservation_windows_by_node=reservation_windows_by_node,
                 truck_speed=truck_speed,
             )
         else:
@@ -418,6 +470,7 @@ class PlannerBridge:
             start_time=truck_route_ready_at,
             truck_speed=truck_speed,
             reservation_constraints=reservation_constraints,
+            reservation_windows_by_node=reservation_windows_by_node,
         )
 
     def _resolve_truck_mandatory_orders(self, runtime_state: Any) -> list[tuple[str, Any]]:
@@ -520,6 +573,9 @@ class PlannerBridge:
         start_time: float,
         mandatory_nodes: Sequence[_TruckPlanNode],
         reservation_constraints: Sequence[TruckReservationConstraint],
+        reservation_windows_by_node: Mapping[
+            str, tuple[_ReservationWindow, ...]
+        ],
         truck_speed: float,
     ) -> _TruckRouteCandidate | None:
         if not mandatory_nodes:
@@ -543,6 +599,7 @@ class PlannerBridge:
                     start_pos=start_pos,
                     start_time=start_time,
                     reservation_constraints=reservation_constraints,
+                    reservation_windows_by_node=reservation_windows_by_node,
                     truck_speed=truck_speed,
                 )
                 for nodes in permutations(ordered_nodes)
@@ -569,6 +626,7 @@ class PlannerBridge:
                             start_pos=start_pos,
                             start_time=start_time,
                             reservation_constraints=reservation_constraints,
+                            reservation_windows_by_node=reservation_windows_by_node,
                             truck_speed=truck_speed,
                         )
                     )
@@ -588,6 +646,7 @@ class PlannerBridge:
                 start_pos=start_pos,
                 start_time=start_time,
                 reservation_constraints=reservation_constraints,
+                reservation_windows_by_node=reservation_windows_by_node,
                 truck_speed=truck_speed,
             )
             for nodes in beam
@@ -607,6 +666,9 @@ class PlannerBridge:
         start_pos: Any,
         start_time: float,
         reservation_constraints: Sequence[TruckReservationConstraint],
+        reservation_windows_by_node: Mapping[
+            str, tuple[_ReservationWindow, ...]
+        ],
         truck_speed: float,
     ) -> _TruckRouteCandidate:
         arrival_times, departure_times = self._simulate_truck_node_times(
@@ -615,10 +677,12 @@ class PlannerBridge:
             start_time=start_time,
             truck_speed=truck_speed,
             reservation_constraints=reservation_constraints,
+            reservation_windows_by_node=reservation_windows_by_node,
         )
         key = self._truck_route_key(
             nodes=nodes,
             arrival_times=arrival_times,
+            departure_times=departure_times,
             reservation_constraints=reservation_constraints,
             start_time=start_time,
         )
@@ -634,6 +698,7 @@ class PlannerBridge:
         *,
         nodes: Sequence[_TruckPlanNode],
         arrival_times: Sequence[float],
+        departure_times: Sequence[float],
         reservation_constraints: Sequence[TruckReservationConstraint],
         start_time: float,
     ) -> tuple[float, ...]:
@@ -677,16 +742,8 @@ class PlannerBridge:
                     hard_invalid_count += 1
 
         last_departure = float(start_time)
-        if nodes:
-            _arrival_times, departure_times = self._simulate_truck_node_times(
-                nodes=nodes,
-                start_pos=None,
-                start_time=start_time,
-                truck_speed=1.0,
-                precomputed_arrivals=tuple(arrival_times),
-                reservation_constraints=reservation_constraints,
-            )
-            last_departure = departure_times[-1]
+        if departure_times:
+            last_departure = float(departure_times[-1])
         total_route_time = max(0.0, last_departure - float(start_time))
         return (
             float(truck_timeout_count),
@@ -708,10 +765,18 @@ class PlannerBridge:
         truck_speed: float,
         precomputed_arrivals: Sequence[float] | None = None,
         reservation_constraints: Sequence[TruckReservationConstraint] = (),
+        reservation_windows_by_node: Mapping[
+            str, tuple[_ReservationWindow, ...]
+        ]
+        | None = None,
     ) -> tuple[tuple[float, ...], tuple[float, ...]]:
         arrivals: list[float] = []
         departures: list[float] = []
-        windows_by_node = self._reservation_windows_by_node(reservation_constraints)
+        windows_by_node = (
+            self._reservation_windows_by_node(reservation_constraints)
+            if reservation_windows_by_node is None
+            else reservation_windows_by_node
+        )
         if precomputed_arrivals is not None:
             for node, arrival in zip(nodes, precomputed_arrivals, strict=True):
                 effective_arrival = max(
@@ -808,6 +873,9 @@ class PlannerBridge:
         start_pos: Any,
         start_time: float,
         reservation_constraints: Sequence[TruckReservationConstraint],
+        reservation_windows_by_node: Mapping[
+            str, tuple[_ReservationWindow, ...]
+        ],
         truck_speed: float,
     ) -> tuple[_TruckPlanNode, ...]:
         target_station_count = max(0, int(self._cfg.patrol_stations_per_loop))
@@ -832,7 +900,9 @@ class PlannerBridge:
             start_time=start_time,
             reservation_constraints=reservation_constraints,
             truck_speed=truck_speed,
+            reservation_windows_by_node=reservation_windows_by_node,
         ).key
+        bonus_order_cache = self._build_station_bonus_order_cache(runtime_state)
         while _station_count(selected) < target_station_count:
             best_insert: (
                 tuple[
@@ -855,6 +925,11 @@ class PlannerBridge:
                         + (station,)
                         + selected[insert_idx:]
                     )
+                    if self._violates_station_anti_pingpong(
+                        runtime_state=runtime_state,
+                        candidate_nodes=candidate,
+                    ):
+                        continue
                     candidate_eval_nodes = candidate + (
                         (depot_node,) if depot_node is not None else ()
                     )
@@ -863,6 +938,7 @@ class PlannerBridge:
                         start_pos=start_pos,
                         start_time=start_time,
                         reservation_constraints=reservation_constraints,
+                        reservation_windows_by_node=reservation_windows_by_node,
                         truck_speed=truck_speed,
                     )
                     candidate_key = candidate_eval.key
@@ -874,6 +950,8 @@ class PlannerBridge:
                         runtime_state=runtime_state,
                         station=station,
                         station_eta=float(station_eta),
+                        bonus_order_cache=bonus_order_cache,
+                        selected_station_nodes=selected,
                     )
                     adjusted_extra_time = float(extra_route_time) - float(
                         opportunity_bonus
@@ -905,12 +983,36 @@ class PlannerBridge:
             base_key = best_insert[5]
         return selected
 
+    def _build_station_bonus_order_cache(
+        self,
+        runtime_state: Any,
+    ) -> dict[str, tuple[Any, float]]:
+        cache: dict[str, tuple[Any, float]] = {}
+        for order_id, order in getattr(runtime_state, "pending_orders", {}).items():
+            if (
+                float(order.payload_weight)
+                > self._heavy_payload_capacity + _TIME_EPS
+            ):
+                continue
+            delivery_finish = self._estimate_earliest_uav_delivery_finish(
+                runtime_state=runtime_state,
+                order=order,
+            )
+            if delivery_finish is None:
+                continue
+            if float(delivery_finish) > float(order.deadline) + _TIME_EPS:
+                continue
+            cache[str(order_id)] = (order, float(delivery_finish))
+        return cache
+
     def _station_recovery_opportunity_bonus(
         self,
         *,
         runtime_state: Any,
         station: _TruckPlanNode,
         station_eta: float,
+        bonus_order_cache: Mapping[str, tuple[Any, float]] | None = None,
+        selected_station_nodes: Sequence[_TruckPlanNode] = (),
     ) -> float:
         """Estimate how useful a station visit is for pending UAV Mode C recovery.
 
@@ -920,28 +1022,35 @@ class PlannerBridge:
         if station.node_type != "station":
             return 0.0
 
-        pending_orders = getattr(runtime_state, "pending_orders", {})
-        if not pending_orders:
+        if bonus_order_cache is None:
+            bonus_order_cache = self._build_station_bonus_order_cache(runtime_state)
+        if not bonus_order_cache:
             return 0.0
 
         support_radius_m = max(100.0, float(self._cfg.support_radius_km) * 1000.0)
+        covered_spatial_score = self._selected_station_spatial_coverage(
+            bonus_order_cache=bonus_order_cache,
+            selected_station_nodes=selected_station_nodes,
+            support_radius_m=support_radius_m,
+        )
         bonus = 0.0
-        for order in pending_orders.values():
-            if float(order.payload_weight) > self._heavy_payload_capacity + _TIME_EPS:
-                continue
-
-            delivery_finish = self._estimate_earliest_uav_delivery_finish(
-                runtime_state=runtime_state,
-                order=order,
-            )
-            if delivery_finish is None:
-                continue
-            if float(delivery_finish) > float(order.deadline) + _TIME_EPS:
-                continue
-
+        nearby_uncovered_count = 0
+        for order_id, (order, delivery_finish) in bonus_order_cache.items():
             distance_to_station = float(order.delivery_loc.distance_2d(station.position))
             spatial_score = max(0.0, 1.0 - distance_to_station / support_radius_m)
             if spatial_score <= _TIME_EPS:
+                continue
+
+            covered_score = max(0.0, float(covered_spatial_score.get(str(order_id), 0.0)))
+            if covered_score < spatial_score - _TIME_EPS:
+                nearby_uncovered_count += 1
+            overlap_discount = min(
+                1.0,
+                max(0.0, float(self._cfg.station_overlap_discount_ratio))
+                * min(1.0, covered_score),
+            )
+            effective_spatial_score = spatial_score * (1.0 - overlap_discount)
+            if effective_spatial_score <= _TIME_EPS:
                 continue
 
             recovery_flight_time = distance_to_station / max(
@@ -958,13 +1067,46 @@ class PlannerBridge:
             window = max(_TIME_EPS, float(order.time_window_seconds))
             urgency = 1.0 - min(1.0, remaining / window)
             bonus += (
-                _RECOVERY_OPPORTUNITY_BONUS_SEC
-                * spatial_score
+                float(self._cfg.recovery_opportunity_bonus_sec)
+                * effective_spatial_score
                 * temporal_score
                 * (0.75 + 0.25 * urgency)
             )
 
-        return min(_RECOVERY_OPPORTUNITY_BONUS_CAP_SEC, float(bonus))
+        density_ratio = (
+            float(nearby_uncovered_count) / float(len(bonus_order_cache))
+            if bonus_order_cache
+            else 0.0
+        )
+        bonus += float(self._cfg.station_density_bonus_sec) * density_ratio
+
+        return min(float(self._cfg.recovery_opportunity_bonus_cap_sec), float(bonus))
+
+    def _selected_station_spatial_coverage(
+        self,
+        *,
+        bonus_order_cache: Mapping[str, tuple[Any, float]],
+        selected_station_nodes: Sequence[_TruckPlanNode],
+        support_radius_m: float,
+    ) -> dict[str, float]:
+        coverage: dict[str, float] = {}
+        for selected_station in selected_station_nodes:
+            if selected_station.node_type != "station":
+                continue
+            for order_id, (order, _delivery_finish) in bonus_order_cache.items():
+                distance_to_station = float(
+                    order.delivery_loc.distance_2d(selected_station.position)
+                )
+                spatial_score = max(
+                    0.0,
+                    1.0 - distance_to_station / max(_TIME_EPS, support_radius_m),
+                )
+                if spatial_score <= _TIME_EPS:
+                    continue
+                current = coverage.get(str(order_id), 0.0)
+                if spatial_score > current:
+                    coverage[str(order_id)] = float(spatial_score)
+        return coverage
 
     def _estimate_earliest_uav_delivery_finish(
         self,
@@ -1027,6 +1169,29 @@ class PlannerBridge:
             )
         return tuple(nodes)
 
+    def _violates_station_anti_pingpong(
+        self,
+        *,
+        runtime_state: Any,
+        candidate_nodes: Sequence[_TruckPlanNode],
+    ) -> bool:
+        recent_station_ids = tuple(
+            str(node_id)
+            for node_id in getattr(runtime_state, "recent_truck_station_ids", ())
+            if node_id
+        )
+        candidate_station_ids = tuple(
+            str(node.node_id)
+            for node in candidate_nodes
+            if node.node_type == "station"
+        )
+        station_sequence = recent_station_ids + candidate_station_ids
+        return _station_sequence_violates_anti_pingpong(
+            station_sequence,
+            min_gap=_STATION_ANTI_PINGPONG_MIN_GAP,
+            check_from_index=len(recent_station_ids),
+        )
+
     def _select_coverage_nodes(
         self,
         *,
@@ -1078,6 +1243,10 @@ class PlannerBridge:
         start_time: float,
         truck_speed: float,
         reservation_constraints: Sequence[TruckReservationConstraint] = (),
+        reservation_windows_by_node: Mapping[
+            str, tuple[_ReservationWindow, ...]
+        ]
+        | None = None,
     ) -> tuple[TruckPlanStopView, ...]:
         arrivals, departures = self._simulate_truck_node_times(
             nodes=nodes,
@@ -1085,6 +1254,7 @@ class PlannerBridge:
             start_time=start_time,
             truck_speed=truck_speed,
             reservation_constraints=reservation_constraints,
+            reservation_windows_by_node=reservation_windows_by_node,
         )
         return tuple(
             TruckPlanStopView(
@@ -1098,14 +1268,14 @@ class PlannerBridge:
             for idx, node in enumerate(nodes)
         )
 
-    def _visits_from_truck_plan_stops(
+    def _handoff_visits_from_truck_plan_stops(
         self,
         truck_plan_stops: Sequence[TruckPlanStopView],
     ) -> tuple[_PlanVisit, ...]:
         visits: list[_PlanVisit] = []
         seen: set[str] = set()
         for stop in truck_plan_stops:
-            if stop.node_type not in {"station", "depot"}:
+            if stop.node_type != "station":
                 continue
             if stop.node_id in seen:
                 continue
@@ -1118,6 +1288,24 @@ class PlannerBridge:
                 )
             )
         return tuple(visits)
+
+    def _station_handoff_visits(
+        self,
+        visits: Sequence[Any],
+        *,
+        runtime_state: Any,
+    ) -> tuple[Any, ...]:
+        node_states = getattr(runtime_state, "node_states", {})
+        return tuple(
+            visit
+            for visit in visits
+            if getattr(
+                node_states.get(str(getattr(visit, "node_id", ""))),
+                "node_type",
+                None,
+            )
+            == "station"
+        )
 
     def _truck_eta_map_for_reservations(
         self,
@@ -1143,10 +1331,25 @@ class PlannerBridge:
         truck_speed: float,
     ) -> float:
         if self._truck_travel_time_provider is not None:
-            return max(
+            cache_key = (
+                _position_cache_key(from_pos),
+                _position_cache_key(to_pos),
+                float(truck_speed),
+            )
+            cached = self._truck_travel_time_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            travel_time = max(
                 0.0,
                 float(self._truck_travel_time_provider(from_pos, to_pos)),
             )
+            if (
+                len(self._truck_travel_time_cache)
+                >= _TRUCK_TRAVEL_TIME_CACHE_MAX_ENTRIES
+            ):
+                self._truck_travel_time_cache.clear()
+            self._truck_travel_time_cache[cache_key] = travel_time
+            return travel_time
         raise RuntimeError(
             "PlannerBridge 动态卡车重排必须提供 truck_travel_time_provider，"
             "不能回退到直线距离"
@@ -1230,6 +1433,27 @@ def _load_planner_config(config_path: Path) -> _PlannerConfig:
             planner.get("allow_empty_backbone_route", False)
         ),
         beam_width=max(1, int(planner.get("beam_width", 8))),
+        recovery_opportunity_bonus_sec=float(
+            planner.get(
+                "recovery_opportunity_bonus_sec",
+                _RECOVERY_OPPORTUNITY_BONUS_SEC,
+            )
+        ),
+        recovery_opportunity_bonus_cap_sec=float(
+            planner.get(
+                "recovery_opportunity_bonus_cap_sec",
+                _RECOVERY_OPPORTUNITY_BONUS_CAP_SEC,
+            )
+        ),
+        station_density_bonus_sec=float(
+            planner.get("station_density_bonus_sec", _STATION_DENSITY_BONUS_SEC)
+        ),
+        station_overlap_discount_ratio=float(
+            planner.get(
+                "station_overlap_discount_ratio",
+                _STATION_OVERLAP_DISCOUNT_RATIO,
+            )
+        ),
     )
 
 
@@ -1281,6 +1505,50 @@ def _worsens_primary_metrics(
         if candidate_key[idx] > base_key[idx] + _TIME_EPS:
             return True
     return False
+
+
+def _station_sequence_violates_anti_pingpong(
+    station_ids: Sequence[str],
+    *,
+    min_gap: int,
+    check_from_index: int = 0,
+) -> bool:
+    last_station_idx: dict[str, int] = {}
+    last_pair_idx: dict[frozenset[str], int] = {}
+    min_gap = max(0, int(min_gap))
+    check_from_index = max(0, int(check_from_index))
+    previous_station: str | None = None
+    for idx, raw_station_id in enumerate(station_ids):
+        station_id = str(raw_station_id)
+        previous_idx = last_station_idx.get(station_id)
+        if (
+            idx >= check_from_index
+            and previous_idx is not None
+            and idx - previous_idx - 1 < min_gap
+        ):
+            return True
+        last_station_idx[station_id] = idx
+
+        if previous_station is not None and previous_station != station_id:
+            pair_key = frozenset((previous_station, station_id))
+            previous_pair_idx = last_pair_idx.get(pair_key)
+            if (
+                idx >= check_from_index
+                and previous_pair_idx is not None
+                and idx - previous_pair_idx - 2 < min_gap
+            ):
+                return True
+            last_pair_idx[pair_key] = idx - 1
+        previous_station = station_id
+    return False
+
+
+def _position_cache_key(position: Any) -> tuple[float, float, float]:
+    return (
+        float(position.x),
+        float(position.y),
+        float(getattr(position, "z", 0.0)),
+    )
 
 
 def _load_yaml(config_path: Path) -> Mapping[str, Any]:
