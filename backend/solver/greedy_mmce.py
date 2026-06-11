@@ -933,7 +933,7 @@ class GreedyMMCE:
             start_node = get_nearest_node(pos1)
             end_node = get_nearest_node(pos2)
             if not start_node or not end_node:
-                raise RuntimeError("无法将坐标映射到 OSM 路网节点")
+                return pos1.distance_2d(pos2), [pos1, pos2]
 
             if start_node == end_node:
                 return pos1.distance_2d(pos2), [pos1, pos2]
@@ -956,7 +956,7 @@ class GreedyMMCE:
 
             path = _osm_svc.shortest_path(road_graph, start_node, end_node)
             if not path:
-                raise RuntimeError(f"OSM 路段不可达: {start_node} -> {end_node}")
+                return pos1.distance_2d(pos2), [pos1, pos2]
 
             dist = 0.0
             segment_geometry: list[Position3D] = []
@@ -1434,14 +1434,14 @@ class GreedyMMCE:
             return node
 
         def calc_dist_and_geometry(pos1: Position3D, pos2: Position3D) -> tuple[float, list[Position3D]]:
-            """计算距离并返回对应几何（UTM）；严格使用 OSM，不允许近似回退。"""
+            """计算距离并返回对应几何（UTM）；若 OSM 路段不可达，则回退至直线距离。"""
             if road_graph is None or len(road_graph.nodes()) == 0:
                 raise RuntimeError("OSM 路网为空，无法进行卡车路径规划")
 
             start_node = get_nearest_node(pos1)
             end_node = get_nearest_node(pos2)
             if not start_node or not end_node:
-                raise RuntimeError("无法将坐标映射到 OSM 路网节点")
+                return pos1.distance_2d(pos2), [pos1, pos2]
 
             # 起终点吸附到同一 OSM 节点时，视为可达的局部短段（避免误判“不可达”）
             if start_node == end_node:
@@ -1465,7 +1465,7 @@ class GreedyMMCE:
 
             path = _osm_svc.shortest_path(road_graph, start_node, end_node)
             if not path:
-                raise RuntimeError(f"OSM 路段不可达: {start_node} -> {end_node}")
+                return pos1.distance_2d(pos2), [pos1, pos2]
 
             dist = 0.0
             segment_geometry: list[Position3D] = []

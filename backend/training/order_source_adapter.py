@@ -18,7 +18,13 @@ import hashlib
 import random
 import sys
 from dataclasses import asdict, dataclass, field, replace
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from pathlib import Path
 from typing import Any, Mapping
 

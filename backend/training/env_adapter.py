@@ -28,8 +28,14 @@ import math
 import random
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+try:
+    from datetime import datetime, timezone
 from enum import StrEnum
+except ImportError:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from pathlib import Path
 from typing import Any, Mapping, TypeAlias
 

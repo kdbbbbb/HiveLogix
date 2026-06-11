@@ -52,45 +52,36 @@
               <span v-else class="sc-bbox-hint--warn">⚠️ 未加载仿真场景，将使用默认 bbox（上海）</span>
             </div>
 
+            <!-- 统一控制行 -->
             <div class="sc-action-row">
-              <button class="sc-btn sc-btn--init" :disabled="initLoading || systemStore.trainingRunning" @click="doInit">
-                {{ initLoading ? '⏳ 初始化中...' : '🚀 初始化并发送到后端' }}
-              </button>
-              <button class="sc-btn sc-btn--start"
-                :disabled="!initDone || systemStore.running || systemStore.trainingRunning"
-                @click="systemStore.start()">▶ 启动</button>
-              <button class="sc-btn sc-btn--pause"
-                :disabled="!systemStore.running"
-                @click="systemStore.pause()">⏸ 暂停</button>
-              <button class="sc-btn sc-btn--reset" :disabled="systemStore.trainingRunning" @click="doReset">🔄 重置</button>
-            </div>
-
-            <!-- 调度控制行 -->
-            <div class="sc-action-row">
-              <button class="sc-btn sc-btn--dispatch"
+              <!-- 算法选择 -->
+              <button class="sc-btn sc-btn--dispatch sc-btn--algo"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
                 :disabled="classicDispatchDisabled"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning || systemStore.running"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
-                🧩 贪心（增量）
+                贪心插入式算法
               </button>
-              <button class="sc-btn sc-btn--dispatch"
+              <button class="sc-btn sc-btn--dispatch sc-btn--algo"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
-                :disabled="classicDispatchDisabled"
+                :disabled="classicDispatchDisabled || systemStore.running"
                 @click="dispatchSolver = 'ga_mmce'">
-                🧬 遗传算法
+                遗传算法
               </button>
-              <button class="sc-btn sc-btn--policy"
+              <button class="sc-btn sc-btn--policy sc-btn--algo"
                 :class="{ 'sc-btn--policy-active': systemStore.policyActive }"
                 :disabled="!initDone || dispatchLoading || policyLoading || systemStore.trainingRunning || (!systemStore.policyActive && !ppoReadyForActivation) || (systemStore.policyActive && systemStore.running)"
                 @click="doPpoPolicyButton">
                 <span>{{ ppoPolicyButtonText }}</span>
                 <span v-if="policyLoading" class="sc-btn-spinner" aria-hidden="true"></span>
               </button>
+              
+              <!-- GA 缓存复用 -->
               <label v-if="dispatchSolver === 'ga_mmce'" class="dispatch-cache-toggle">
                 <input
                   v-model="reuseGaStaticPlan"
                   type="checkbox"
-                  :disabled="classicDispatchDisabled"
+                  :disabled="classicDispatchDisabled || systemStore.running"
                 >
                 <span>复用上次静态结果</span>
               </label>
@@ -106,13 +97,26 @@
                 ✓ {{ lastDispatchResult.plan.feasible }}/{{ lastDispatchResult.plan.total_orders }} 可行
               </span>
               <span v-if="systemStore.policyActive" class="dispatch-quick-stat dispatch-quick-stat--policy">
-                PPO 模式下 classic 调度按钮已禁用
+                PPO 模式下调度已禁用
               </span>
               <span v-if="systemStore.trainingRunning" class="dispatch-quick-stat dispatch-quick-stat--policy">
-                PPO 训练直播中 classic 调度按钮已禁用
+                PPO 训练直播中调度已禁用
               </span>
+
+              <button class="sc-btn sc-btn--init" :disabled="initLoading || systemStore.trainingRunning" @click="doInit">
+                {{ initLoading ? '⏳ 初始化中...' : '🚀 初始化并发送到后端' }}
+              </button>
+              <button class="sc-btn sc-btn--start"
+                :disabled="!initDone || systemStore.running || systemStore.trainingRunning || dispatchLoading"
+                @click="doStartWithDispatch">{{ dispatchLoading ? '⏳ 调度中...' : '▶ 启动' }}</button>
+              <button class="sc-btn sc-btn--pause"
+                :disabled="!systemStore.running"
+                @click="systemStore.pause()">⏸ 暂停</button>
+              <button class="sc-btn sc-btn--reset" :disabled="systemStore.trainingRunning" @click="doReset">🔄 重置</button>
+          
+              <!-- 预设保存 -->
               <button class="sc-btn sc-btn--export"
-                :disabled="savingPreset"
+                :disabled="savingPreset || systemStore.running"
                 @click="doSavePreset"
                 title="将当前调整的实体配置和任务点保存到预设文件">
                 {{ savingPreset ? '⏳ 保存中...' : '💾 保存预设' }}
@@ -302,9 +306,9 @@ const ppoCompatibilityMessage = computed(() => {
   return `当前页面与最近一次初始化均匹配 ${PPO_SCENE_ID}，可以激活 PPO。`
 })
 const ppoPolicyButtonText = computed(() => {
-  if (policyLoading.value) return '切换到 PPO 在线策略'
+  if (policyLoading.value) return 'PPO 算法'
   if (systemStore.policyActive) return systemStore.running ? 'PPO 在线运行中' : '▶ 启动 PPO 在线策略'
-  return '切换到 PPO 在线策略'
+  return 'PPO 算法'
 })
 
 // 调度相关状态
@@ -738,6 +742,41 @@ async function doPpoPolicyButton() {
   }
 }
 
+/**
+ * 启动前自动执行调度，然后启动仿真
+ */
+async function doStartWithDispatch() {
+  if (systemStore.running || systemStore.trainingRunning || dispatchLoading.value) return
+  if (!initDone.value) return
+  
+  // 如果是 PPO 模式，直接启动（不需要调度）
+  if (systemStore.policyActive) {
+    try {
+      await systemStore.start()
+      _log('success', '▶ PPO 在线推理已启动')
+    } catch (e: any) {
+      _log('error', `❌ PPO 启动失败：${e.message}`)
+    }
+    return
+  }
+  
+  // Classic 模式：先调度，再启动
+  _log('info', `🎯 正在执行${dispatchSolverLabel(dispatchSolver.value)}调度算法...`)
+  try {
+    // 执行调度
+    await doDispatch()
+    
+    // 调度成功后，自动启动仿真
+    if (lastDispatchResult.value && lastDispatchResult.value.status === 'ok') {
+      _log('info', '▶ 调度完成，正在启动仿真...')
+      await systemStore.start()
+      _log('success', '✅ 仿真已启动')
+    }
+  } catch (e: any) {
+    _log('error', `❌ 启动过程出错：${e.message}`)
+  }
+}
+
 async function doDispatch() {
   if (systemStore.policyActive) {
     _log('warn', '⚠️ PPO 模式下 classic 调度按钮已禁用')
@@ -1153,6 +1192,10 @@ onBeforeUnmount(() => {
 .sc-btn--dispatch-active {
   background: #0369a1;
   box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.18);
+}
+.sc-btn--algo {
+  min-width: 178px;
+  width: 178px;
 }
 .sc-btn--dispatch-run {
   flex: 1;

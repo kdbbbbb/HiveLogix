@@ -20,7 +20,13 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from typing import Any, FrozenSet, Mapping, TypeAlias
 
 from .actions import DispatchAction, GlobalWaitAction
