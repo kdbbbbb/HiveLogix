@@ -52,13 +52,26 @@
               <span v-else class="sc-bbox-hint--warn">⚠️ 未加载仿真场景，将使用默认 bbox（上海）</span>
             </div>
 
-            <!-- 统一控制行 -->
-            <div class="sc-action-row">
+            <!-- 运行控制行 -->
+            <div class="sc-action-row sc-action-row--runtime">
+              <button class="sc-btn sc-btn--init" :disabled="initLoading || systemStore.trainingRunning" @click="doInit">
+                {{ initLoading ? '⏳ 初始化中...' : '🚀 初始化并发送到后端' }}
+              </button>
+              <button class="sc-btn sc-btn--start"
+                :disabled="!initDone || systemStore.running || systemStore.trainingRunning || dispatchLoading"
+                @click="doStartWithDispatch">{{ dispatchLoading ? '⏳ 调度中...' : '▶ 启动' }}</button>
+              <button class="sc-btn sc-btn--pause"
+                :disabled="!systemStore.running"
+                @click="systemStore.pause()">⏸ 暂停</button>
+              <button class="sc-btn sc-btn--reset" :disabled="systemStore.trainingRunning" @click="doReset">🔄 重置</button>
+            </div>
+
+            <!-- 算法与调度控制行 -->
+            <div class="sc-action-row sc-action-row--algorithm">
               <!-- 算法选择 -->
               <button class="sc-btn sc-btn--dispatch sc-btn--algo"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
-                :disabled="classicDispatchDisabled"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning || systemStore.running"
+                :disabled="classicDispatchDisabled || systemStore.running"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
                 贪心插入式算法
               </button>
@@ -70,7 +83,7 @@
               </button>
               <button class="sc-btn sc-btn--policy sc-btn--algo"
                 :class="{ 'sc-btn--policy-active': systemStore.policyActive }"
-                :disabled="!initDone || dispatchLoading || policyLoading || systemStore.trainingRunning || (!systemStore.policyActive && !ppoReadyForActivation) || (systemStore.policyActive && systemStore.running)"
+                :disabled="!initDone || dispatchLoading || policyLoading || systemStore.trainingRunning || classicDispatchCommitted || (!systemStore.policyActive && !ppoReadyForActivation) || (systemStore.policyActive && systemStore.running)"
                 @click="doPpoPolicyButton">
                 <span>{{ ppoPolicyButtonText }}</span>
                 <span v-if="policyLoading" class="sc-btn-spinner" aria-hidden="true"></span>
@@ -103,17 +116,6 @@
                 PPO 训练直播中调度已禁用
               </span>
 
-              <button class="sc-btn sc-btn--init" :disabled="initLoading || systemStore.trainingRunning" @click="doInit">
-                {{ initLoading ? '⏳ 初始化中...' : '🚀 初始化并发送到后端' }}
-              </button>
-              <button class="sc-btn sc-btn--start"
-                :disabled="!initDone || systemStore.running || systemStore.trainingRunning || dispatchLoading"
-                @click="doStartWithDispatch">{{ dispatchLoading ? '⏳ 调度中...' : '▶ 启动' }}</button>
-              <button class="sc-btn sc-btn--pause"
-                :disabled="!systemStore.running"
-                @click="systemStore.pause()">⏸ 暂停</button>
-              <button class="sc-btn sc-btn--reset" :disabled="systemStore.trainingRunning" @click="doReset">🔄 重置</button>
-          
               <!-- 预设保存 -->
               <button class="sc-btn sc-btn--export"
                 :disabled="savingPreset || systemStore.running"
@@ -312,13 +314,14 @@ const ppoPolicyButtonText = computed(() => {
 })
 
 // 调度相关状态
+type DispatchSolverName = 'greedy_mmce_bi' | 'ga_mmce'
 const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
+const lastDispatchSolver = ref<DispatchSolverName | null>(null)
 const totalEnergyCostWh = ref(0)
 // 本地 UI 游标：避免把同一条 PPO 决策事件重复写入 DynamicFlowPanel。
 const lastRenderedDecisionEventSeq = ref(0)
-type DispatchSolverName = 'greedy_mmce_bi' | 'ga_mmce'
 const dispatchSolver = ref<DispatchSolverName>('greedy_mmce_bi')
 const reuseGaStaticPlan = ref(false)
 const classicDispatchDisabled = computed(() =>
@@ -333,6 +336,21 @@ function dispatchSolverLabel(solver: DispatchSolverName): string {
   if (solver === 'greedy_mmce_bi') return '贪心（增量）'
   return '遗传算法'
 }
+
+function hasReusableClassicDispatchPlan(): boolean {
+  const plan = dispatchPlan.value
+  return Boolean(
+    lastDispatchResult.value?.status === 'ok' &&
+    plan &&
+    Number(plan.total_orders ?? 0) > 0 &&
+    lastDispatchSolver.value === dispatchSolver.value
+  )
+}
+const classicDispatchCommitted = computed(() => Boolean(
+  lastDispatchResult.value?.status === 'ok' &&
+  dispatchPlan.value &&
+  Number(dispatchPlan.value.total_orders ?? 0) > 0
+))
 
 // 预设保存状态
 const savingPreset = ref(false)
@@ -594,7 +612,12 @@ function _log(type: CtrlLog['type'], msg: string) {
 
 async function doInit() {
   initLoading.value = true
+  lastDispatchResult.value = null
+  dispatchPlan.value = null
+  lastDispatchSolver.value = null
   totalEnergyCostWh.value = 0
+  mapRef.value?.clearDispatchRoutes?.()
+  mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
   _log('info', '正在发送初始化请求到后端...')
   try {
     const bounds = sceneStore.context?.road_network.bounds
@@ -690,8 +713,13 @@ async function doInit() {
 
 async function doReset() {
   await systemStore.reset().catch(() => {})
+  lastDispatchResult.value = null
+  dispatchPlan.value = null
+  lastDispatchSolver.value = null
   lastRenderedDecisionEventSeq.value = 0
   totalEnergyCostWh.value = 0
+  mapRef.value?.clearDispatchRoutes?.()
+  mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
   _log('warn', '🔄 仿真已重置，请重新初始化')
 }
 
@@ -729,6 +757,10 @@ async function doActivatePolicy() {
 }
 
 async function doPpoPolicyButton() {
+  if (classicDispatchCommitted.value && !systemStore.policyActive) {
+    _log('warn', '⚠️ Classic 调度方案已生成，请重置或重新初始化后再切换 PPO 算法')
+    return
+  }
   if (!systemStore.policyActive) {
     await doActivatePolicy()
     return
@@ -760,11 +792,14 @@ async function doStartWithDispatch() {
     return
   }
   
-  // Classic 模式：先调度，再启动
-  _log('info', `🎯 正在执行${dispatchSolverLabel(dispatchSolver.value)}调度算法...`)
+  // Classic 模式：若已手动调度成功，直接启动；否则先调度再启动。
   try {
-    // 执行调度
-    await doDispatch()
+    if (hasReusableClassicDispatchPlan()) {
+      _log('info', `▶ 使用已有${dispatchSolverLabel(dispatchSolver.value)}调度方案启动仿真`)
+    } else {
+      _log('info', `🎯 正在执行${dispatchSolverLabel(dispatchSolver.value)}调度算法...`)
+      await doDispatch()
+    }
     
     // 调度成功后，自动启动仿真
     if (lastDispatchResult.value && lastDispatchResult.value.status === 'ok') {
@@ -843,6 +878,7 @@ async function doDispatch() {
       }
 
       dispatchPlan.value = plan
+      lastDispatchSolver.value = dispatchSolver.value
 
       const runtimeEnergyWh = Number(result.runtime_metrics?.total_energy_cost_wh)
       if (Number.isFinite(runtimeEnergyWh) && runtimeEnergyWh >= 0) {
@@ -1172,6 +1208,18 @@ onBeforeUnmount(() => {
 
 /* 操作按钮行 */
 .sc-action-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.sc-action-row--runtime {
+  align-items: center;
+}
+.sc-action-row--runtime .sc-btn {
+  min-width: 104px;
+}
+.sc-action-row--runtime .sc-btn--init {
+  flex: 1 1 240px;
+}
+.sc-action-row--algorithm {
+  align-items: center;
+}
 .sc-btn {
   height: 34px; padding: 0 16px; border-radius: var(--hl-border-radius);
   font-size: 13px; font-weight: 500; cursor: pointer;

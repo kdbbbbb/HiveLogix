@@ -489,6 +489,39 @@ def _serialize_drone_route(
     """将无人机任务路径转换为可视化航线。"""
     if order is None:
         return None
+
+    if alloc.mode == "B_WAIT":
+        launch_entity = (
+            _entity_mgr.stations.get(alloc.launch_station_id)
+            or _entity_mgr.depots.get(alloc.launch_station_id)
+        )
+        recovery_entity = (
+            _entity_mgr.stations.get(alloc.recovery_station_id)
+            or _entity_mgr.depots.get(alloc.recovery_station_id)
+        )
+        if launch_entity is None or recovery_entity is None:
+            return None
+
+        launch_loc = launch_entity.location
+        delivery_loc = order.delivery_loc
+        recovery_loc = recovery_entity.location
+        launch_node_id = alloc.launch_station_id
+        launch_node_type = "station" if alloc.launch_station_id in _entity_mgr.stations else "depot"
+
+        return {
+            "drone_id": alloc.drone_id,
+            "order_id": alloc.order_id,
+            "mode": alloc.mode,
+            "launch_node_id": launch_node_id,
+            "launch_node_type": launch_node_type,
+            "launch_time": float(getattr(alloc, "launch_time", 0.0) or 0.0),
+            "recovery_station_id": alloc.recovery_station_id,
+            "path": [
+                list(utm_to_wgs84(launch_loc.x, launch_loc.y)),
+                list(utm_to_wgs84(delivery_loc.x, delivery_loc.y)),
+                list(utm_to_wgs84(recovery_loc.x, recovery_loc.y)),
+            ],
+        }
     
     if alloc.mode == "B":
         selected = _select_mode_b_launch_and_recovery(alloc, order, current_time, truck_routes)
